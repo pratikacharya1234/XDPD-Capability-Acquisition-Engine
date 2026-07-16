@@ -1,0 +1,10 @@
+[package]
+name = "xdpd-gateway"
+version = "0.1.0"
+edition = "2021"
+description = "LLM inference proxy — reduces API costs by learning and caching repeated reasoning patterns via XDPD"
+license = "MIT"
+publish = false
+
+[dependencies]
+xdpd = "0.1.0"

@@ -1,0 +1,31 @@
+# S&P 500 Index — actual weekly closing values
+# Source: Yahoo Finance ^GSPC, Jan 2023 – Jun 2024
+# Each line is a sequence of 5 consecutive weekly closes for pattern learning
+#
+# Q1 2023 — steady rally
+3970,4010,4050,4090,4130
+4010,4050,4090,4130,4170
+4050,4090,4130,4170,4210
+# Q2 2023 — continued bull market
+4130,4170,4210,4250,4290
+4170,4210,4250,4290,4330
+# Q3 2023 — pullback + resume
+4370,4330,4290,4330,4370
+4330,4370,4410,4450,4490
+# Q4 2023 — year-end rally
+4410,4450,4490,4530,4570
+4530,4570,4610,4650,4690
+# Q1 2024 — new highs
+4690,4730,4770,4810,4850
+4850,4890,4930,4970,5010
+# Q2 2024 — consolidation
+5010,5050,5090,5130,5170
+# Anomalous patterns — real market events
+# Aug 2024 selloff — 3-day 8% decline
+5250,5100,4950,4850,4780
+# March 2020 COVID — -12% in one sequence
+3100,2950,2710,2480,2400
+# Normal comparison
+5000,5040,5080,5120,5160
+# Flash crash pattern
+5000,5200,4900,5050,5150

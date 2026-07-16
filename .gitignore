@@ -1,0 +1,6 @@
+target/
+Cargo.lock
+.DS_Store
+
+# Library source — published on crates.io, not public on GitHub
+xdpd/
