@@ -3,7 +3,7 @@
 [![Crates.io](https://img.shields.io/crates/v/xdpd)](https://crates.io/crates/xdpd)
 [![docs.rs](https://img.shields.io/docsrs/xdpd)](https://docs.rs/xdpd)
 [![CI](https://github.com/pratikacharya1234/XDPD-Capability-Acquisition-Engine/actions/workflows/ci.yml/badge.svg)](https://github.com/pratikacharya1234/XDPD-Capability-Acquisition-Engine/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](xdpd/LICENSE)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-blue.svg)](xdpd/LICENSE-MIT)
 
 Learning by growing an instruction set, not storing data.
 No neural networks. No separate storage. No GPU. Zero dependencies.
@@ -141,4 +141,4 @@ XDPD/
 
 ## License
 
-MIT
+Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.

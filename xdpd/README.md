@@ -4,7 +4,7 @@ A learning mechanism that grows its own instruction set from observed patterns.
 Zero dependencies. Pure Rust. CPU only.
 
 [![Crates.io](https://img.shields.io/crates/v/xdpd)](https://crates.io/crates/xdpd)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
 [![docs.rs](https://img.shields.io/docsrs/xdpd)](https://docs.rs/xdpd)
 
 ## Overview
@@ -118,4 +118,4 @@ cd ../examples && cargo run --release
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.

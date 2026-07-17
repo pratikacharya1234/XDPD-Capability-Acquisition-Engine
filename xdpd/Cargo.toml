@@ -1,9 +1,9 @@
 [package]
 name = "xdpd"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "Capability acquisition engine — learns by growing its own instruction set from observed patterns, not by storing data"
-license = "MIT"
+license = "MIT OR Apache-2.0"
 repository = "https://github.com/pratikacharya1234/XDPD-Capability-Acquisition-Engine/tree/main/xdpd"
 documentation = "https://docs.rs/xdpd"
 readme = "README.md"
