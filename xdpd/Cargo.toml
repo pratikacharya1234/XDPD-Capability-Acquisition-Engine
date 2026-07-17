@@ -1,0 +1,15 @@
+[package]
+name = "xdpd"
+version = "0.2.0"
+edition = "2021"
+description = "Capability acquisition engine — learns by growing its own instruction set from observed patterns, not by storing data"
+license = "MIT"
+repository = "https://github.com/pratikacharya1234/XDPD-Capability-Acquisition-Engine/tree/main/xdpd"
+documentation = "https://docs.rs/xdpd"
+readme = "README.md"
+keywords = ["learning", "ai", "compression", "pattern-detection", "self-modifying"]
+categories = ["algorithms", "science"]
+authors = ["Pratik Acharya"]
+
+[dependencies]
+# Zero dependencies — pure Rust standard library
