@@ -216,16 +216,27 @@ What changes:
 5. Does it detect anomalies? YES — compression ratio < 1.3x flags unknown patterns.
 6. Does the subroutine table hold all state? YES — no raw data retained after observation.
 7. Does it run on CPU with zero dependencies? YES — pure Rust stdlib.
+8. Does it generalize across values, not just memorize one instance? YES —
+   skills store a value-free `PatternShape` (delta+length, or unit-length+count)
+   and re-derive their output at match time. A skill compiled from [0,2,4,6,8]
+   also matches [100,102,104,106,108] and any other unseen delta=2, len=5
+   sequence. Fixed 2026-07 — see `skill_generalizes_across_values` and
+   `constant_skill_dedupes_across_values` in `src/lib.rs`.
+9. Does it survive a process restart? YES — `VM::save_skills_to_file` /
+   `Learner::save_to_file` serialize the subroutine table to a plain-text
+   format, zero extra dependencies. A reloaded skill still generalizes to
+   unseen values the same as before the restart.
 
 ### Known Limitations
 
-- Patterns match exact token values, not parameterized templates.
-  A sequence [100,102,104] with delta=2 does not match a skill learned
-  from [0,2,4] despite sharing the same delta pattern.
-  Template/parametric skills are a planned future extension.
-
 - Repeat patterns compile to per-token bodies. Execution-level cost
   equals naive; savings are at program level (1 Call vs N Load+Output).
+
+- No skill decay/garbage collection yet — the subroutine table grows
+  monotonically and unused skills are never evicted.
+
+- Persistence has a single file format version with no migration path;
+  a breaking format change would require a manual conversion step.
 
 ### Implementation
 

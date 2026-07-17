@@ -1,0 +1,23 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Test xdpd
+        working-directory: xdpd
+        run: cargo test --all-targets
+      - name: Build examples
+        working-directory: examples
+        run: cargo build --release
+      - name: Build gateway example
+        working-directory: examples/gateway
+        run: cargo build --release

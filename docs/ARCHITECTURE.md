@@ -36,18 +36,20 @@ When a pattern is detected and has been observed enough times (configurable via 
 
 ```rust
 struct Skill {
-    name: String,         // e.g., "skill_arith:d2x5"
-    body: Vec<Instr>,     // Compiled instruction sequence
-    output_seq: Vec<Token>, // Expected output for matching
-    strength: i32,        // Decays when unused
-    uses: u32,            // Invocation count
-    signature: String,    // Structural fingerprint
+    name: String,          // e.g., "skill_arith:d2x5"
+    shape: PatternShape,   // Value-free structural template
+    strength: i32,         // Decays when unused
+    uses: u32,             // Invocation count
+    signature: String,     // Structural fingerprint
 }
 ```
 
-The body depends on the pattern type:
+A skill stores a `PatternShape` — the pattern's structure with concrete values stripped out (e.g. `Arithmetic { delta, len }`, with `start` removed) — instead of a frozen instruction body or output sequence. This is what lets one skill generalize: `PatternShape::matches()` checks whether a candidate slice fits the structure and, if so, extracts the params needed to reproduce it (start value, or repeat-unit contents). `PatternShape::to_instructions(params)` then compiles the body on demand at call time, bound to those params:
+
 - **Constant** / **Arithmetic**: `[Seq(start, delta, len), Ret]` — 2 instructions, regardless of sequence length.
 - **Repeat**: Per-token `[Load(t), Output]` pairs — N*2 instructions for N tokens. The compression is at the program level: 1 `Call` replaces all N pairs.
+
+Because the body is regenerated per call, `Instr::Call` carries the bound params alongside the skill name: `Call(name, params)`.
 
 ### 4. DP Composition
 
@@ -83,6 +85,10 @@ The observation window has a configurable maximum size. When full, the oldest ob
 - Skills persist in the subroutine table regardless of window eviction.
 - The subroutine table grows monotonically (no skill deletion in current version).
 
+### 7. Persistence
+
+The subroutine table is the system's only memory, and it lives in process memory by default — nothing survives a restart unless explicitly saved. `VM::save_skills_to_file()` / `VM::load_skills_from_file()` (and the `Learner::save_to_file()` / `Learner::load_from_file()` convenience wrappers) serialize it to a plain-text, tab-delimited file: one line per skill, encoding its `PatternShape` rather than a frozen output — so a skill loaded after a restart still generalizes to unseen values with matching structure, the same as it did before the restart. `load_from_file()` also rebuilds `learned_signatures` from the loaded skills so they aren't recompiled on the next matching observation. The observation window and `LearnerConfig` are intentionally not persisted — they're working state, not learned capability.
+
 ## Data Flow
 
 ```
@@ -111,7 +117,7 @@ Learner::generate()
 compose() — DP over skill table
         |
         v
-Program: [Call("skill_arith:d2x5"), Call("skill_const:45x6"), ..., Ret]
+Program: [Call("skill_arith:d2x5", [start]), Call("skill_const:x6", [value]), ..., Ret]
         |
         v
 VM::run() — execute program
@@ -134,7 +140,7 @@ The VM is intentionally minimal:
 | `subroutines` | The persistent memory — `HashMap<String, Skill>` |
 | `instr_count` | Total instructions executed (for metrics) |
 
-The `Call` instruction saves the current program counter, replaces `program` with the subroutine body, resets `pc` to 0, runs the subroutine, then restores the original program.
+The `Call(name, params)` instruction saves the current program counter, compiles the named skill's `PatternShape` against the bound `params` into a concrete body, replaces `program` with it, resets `pc` to 0, runs the subroutine, then restores the original program.
 
 ## Key Design Decisions
 
@@ -142,9 +148,9 @@ The `Call` instruction saves the current program counter, replaces `program` wit
 
 Rather than a complex type hierarchy, all discrete values map to `u32`. This keeps the system simple and domain-agnostic. The mapping from domain concepts to tokens is external to the engine.
 
-### No parameters in patterns
+### Template skills
 
-Current patterns match exact token sequences. A sequence `[100, 102, 104, 106, 108]` with delta=2 matches `Arithmetic { start: 100, delta: 2, len: 5 }`. A different sequence with the same delta but different start (`[200, 202, 204, 206, 208]`) does NOT match. Template/parametric skills are a planned future extension.
+Skills match on structure, not exact values. A sequence `[100, 102, 104, 106, 108]` and `[200, 202, 204, 206, 208]` both fit `PatternShape::Arithmetic { delta: 2, len: 5 }`, so once that shape is learned from either one, both — and any other delta=2, len=5 sequence, seen or unseen — are recognized and reproduced by the same skill. `detect_pattern()` and `Pattern::signature()` still dedupe by shape during learning (so the same structure isn't compiled twice); it's matching at composition time, in `PatternShape::matches()`, that generalizes across values.
 
 ### Program-level vs execution-level costs
 
@@ -152,15 +158,13 @@ The DP composition optimizes for **program-level** instruction count, where 1 `C
 
 ### Zero dependencies
 
-The engine uses only the Rust standard library. No serde, no tokio, no ndarray, no ML frameworks. This is intentional: the learning mechanism should be embeddable in any environment without dependency management.
+The engine uses only the Rust standard library. No serde, no tokio, no ndarray, no ML frameworks. This is intentional: the learning mechanism should be embeddable in any environment without dependency management. Persistence follows the same rule — the save/load format is a hand-rolled plain-text encoding over `std::fs`/`std::io`, not a serde derive.
 
 ## Future Directions
 
 | Feature | Description |
 |---|---|
-| Template skills | Parametric subroutines matching same pattern structure with different values |
 | Skill decay/GC | Remove unused skills from the subroutine table |
-| Persistent storage | Serialize/deserialize the subroutine table to disk |
 | Parallel observation | Concurrent observation processing with sharded skill tables |
 | Python bindings | PyO3 bindings for Python integration |
 | C FFI | C-compatible API for embedding in C/C++ applications |

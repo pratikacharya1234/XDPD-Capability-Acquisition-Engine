@@ -297,6 +297,88 @@ fn run_analysis(learner: &mut Learner) {
     }
 
     println!("\n  Process custom data: xdpd path/to/file.csv");
+
+    run_generalization_benchmark();
+}
+
+// ---------------------------------------------------------------------------
+// Generalization benchmark — measured, not projected
+// ---------------------------------------------------------------------------
+//
+// A fresh learner is trained on exactly ONE seed instance per pattern shape
+// (3 repeats each, to clear min_occurrences). It's then tested against
+// sequences of the same shape it never observed, plus a control group of
+// different shapes it should NOT match. A "hit" means the whole sequence
+// compressed to a single Call instruction — proof the compiled skill
+// generalized past the instance it was compiled from, not a projection.
+fn run_generalization_benchmark() {
+    println!("\nPHASE 6: Generalization Benchmark (measured, not projected)");
+    println!("=============================================================\n");
+    println!("  Trained on ONE seed sequence per shape (3 repeats to compile).");
+    println!("  Tested against same-shape sequences it never observed, plus a");
+    println!("  control group of different shapes it should reject.\n");
+
+    let mut learner = Learner::new();
+    let seeds: Vec<(&str, Vec<Token>)> = vec![
+        ("constant, len=6", vec![45, 45, 45, 45, 45, 45]),
+        ("arithmetic, delta=40, len=5", vec![3970, 4010, 4050, 4090, 4130]),
+        (
+            "repeat, unit_len=5, count=4",
+            vec![1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0],
+        ),
+    ];
+    for (_, seed) in &seeds {
+        for _ in 0..3 {
+            learner.observe(seed);
+        }
+    }
+    println!("  Seeds trained: {} — skills compiled: {}\n", seeds.len(), learner.skill_count());
+
+    let held_out: Vec<(&str, Vec<Token>)> = vec![
+        ("constant=1, len=6 (unseen value)", vec![1, 1, 1, 1, 1, 1]),
+        ("constant=99, len=6 (unseen value)", vec![99, 99, 99, 99, 99, 99]),
+        ("constant=65535, len=6 (unseen value)", vec![65535; 6]),
+        ("arithmetic start=0, delta=40 (unseen start)", vec![0, 40, 80, 120, 160]),
+        ("arithmetic start=100, delta=40 (unseen start)", vec![100, 140, 180, 220, 260]),
+        ("arithmetic start=999999, delta=40 (unseen start)", vec![999999, 1000039, 1000079, 1000119, 1000159]),
+        ("repeat unit=[9,9,9,9,1] (unseen content)", vec![9, 9, 9, 9, 1, 9, 9, 9, 9, 1, 9, 9, 9, 9, 1, 9, 9, 9, 9, 1]),
+        ("repeat unit=[3,1,4,1,5] (unseen content)", vec![3, 1, 4, 1, 5, 3, 1, 4, 1, 5, 3, 1, 4, 1, 5, 3, 1, 4, 1, 5]),
+    ];
+
+    let control: Vec<(&str, Vec<Token>)> = vec![
+        ("arithmetic delta=7 (different shape, untrained)", vec![1, 8, 15, 22, 29]),
+        ("repeat unit_len=3, count=5 (different shape, untrained)", vec![1, 2, 3, 1, 2, 3, 1, 2, 3, 1, 2, 3, 1, 2, 3]),
+        ("no structural pattern at all", vec![2, 9, 4, 1, 7]),
+    ];
+
+    println!("  {:<52} {:>5} {:>6} {:<4}", "Held-out case (never observed)", "Len", "Cost", "Hit?");
+    println!("  {}", "-".repeat(72));
+    let mut hits = 0usize;
+    for (label, seq) in &held_out {
+        let (_, cost) = learner.generate(seq, true);
+        let hit = cost == 1;
+        if hit {
+            hits += 1;
+        }
+        println!("  {:<52} {:>5} {:>6} {:<4}", label, seq.len(), cost, if hit { "YES" } else { "no" });
+    }
+    let hit_rate = hits as f64 / held_out.len() as f64 * 100.0;
+    println!("  {}", "-".repeat(72));
+    println!("  Skill hit-rate on unseen same-shape data: {}/{} ({:.1}%)\n", hits, held_out.len(), hit_rate);
+
+    println!("  {:<52} {:>5} {:>6} {:<4}", "Control case (different shape — should reject)", "Len", "Cost", "Hit?");
+    println!("  {}", "-".repeat(72));
+    let mut false_positives = 0usize;
+    for (label, seq) in &control {
+        let (_, cost) = learner.generate(seq, true);
+        let hit = cost == 1;
+        if hit {
+            false_positives += 1;
+        }
+        println!("  {:<52} {:>5} {:>6} {:<4}", label, seq.len(), cost, if hit { "YES" } else { "no" });
+    }
+    println!("  {}", "-".repeat(72));
+    println!("  False positives on non-matching shapes: {}/{}\n", false_positives, control.len());
 }
 
 // ---------------------------------------------------------------------------

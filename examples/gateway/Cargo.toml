@@ -7,4 +7,4 @@ license = "MIT"
 publish = false
 
 [dependencies]
-xdpd = "0.1.0"
+xdpd = { path = "../../xdpd", version = "0.2.0" }
