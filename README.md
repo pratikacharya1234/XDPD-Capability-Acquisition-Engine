@@ -116,9 +116,10 @@ cd examples/gateway && cargo run --release
 | Document | Description |
 |---|---|
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Design rationale, data flow, VM internals, design decisions |
-| [RESEARCH.md](RESEARCH.md) | Gap analysis, 10 research findings, hypothesis, honest limitations |
+| [RESEARCH.md](RESEARCH.md) | Gap analysis, research findings, hypothesis, honest limitations |
+| [CHANGELOG.md](CHANGELOG.md) | Version history — what actually changed and why |
 | [examples/README.md](examples/README.md) | Demo walkthrough with full output |
-| [examples/gateway/](examples/gateway/) | LLM inference proxy — real running service |
+| [examples/gateway/](examples/gateway/) | LLM inference proxy demo — runnable, not production-hardened |
 | [docs.rs/xdpd](https://docs.rs/xdpd) | API documentation |
 | [crates.io/crates/xdpd](https://crates.io/crates/xdpd) | Library package |
 
@@ -132,10 +133,14 @@ XDPD/
 ├── docs/
 │   └── ARCHITECTURE.md
 ├── examples/
-│   ├── gateway/        # LLM inference proxy
-│   ├── src/main.rs     # CLI benchmark
+│   ├── gateway/        # LLM inference proxy demo
+│   ├── src/main.rs     # CLI benchmark + generalization test
 │   └── data/           # Sample CSV
+├── .github/workflows/ci.yml
+├── CHANGELOG.md
 ├── RESEARCH.md
+├── LICENSE-MIT
+├── LICENSE-APACHE
 └── README.md
 ```
 

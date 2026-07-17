@@ -1,95 +1,54 @@
-# XDPD Gateway — LLM Inference Proxy
+# XDPD Demo — Full Walkthrough
 
-A real service that sits between your application and any LLM API (OpenAI, Anthropic, etc.). It learns repeated reasoning patterns and serves cached responses instantly — zero API cost, zero latency.
-
-## Quick Start
+The CLI demo in `src/main.rs` runs XDPD against three real-world-shaped datasets (server latency, S&P 500 rally, IoT heartbeat), then benchmarks compression, anomaly detection, and — the part worth actually reading — measures whether learned skills generalize to values they were never trained on.
 
 ```bash
 cargo run --release
 ```
 
-Server starts on `http://127.0.0.1:8080`.
-
-## How It Works
-
-```
-Client → XDPD Gateway → LLM API
-              |
-         subroutine table
-         (the cache — no Redis, no vector DB, no extra infra)
-```
-
-1. Request arrives at the gateway
-2. Gateway hashes the prompt and checks the subroutine table
-3. If pattern is learned: return cached response instantly (0 API cost)
-4. If new: forward to LLM, learn the pattern, cache the response, return it
-
-## API Endpoints
-
-### Chat Completions (OpenAI-compatible)
+Or point it at your own data:
 
 ```bash
-curl -X POST http://localhost:8080/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"model":"gpt-5.6-sol","messages":[{"role":"user","content":"What is 2+2?"}]}'
+cargo run --release -- path/to/file.csv
+# CSV format: one comma-separated sequence per line, # for comments
 ```
 
-First call: cache miss, generates response (or forwards to upstream LLM).
-Second call with same prompt: cache hit, instant response, zero cost.
+## What each phase does
 
-### Stats
+**PHASE 1 — Observation.** Feeds three sequences repeatedly (constant latency baseline, arithmetic S&P 500 rally, repeating IoT pulse) so the learner clears its occurrence threshold and compiles a skill for each shape.
 
-```bash
-curl http://localhost:8080/stats
+**PHASE 2 — Compression benchmark.** Measures program-level instruction count (naive Load+Output per token vs. a single learned `Call`) across the trained sequences plus combinations of them:
+
+```
+Sequence                                          Tokens  Naive ops Learned ops
+------------------------------------------------------------------------------
+Latency baseline (exact match)                         6         13          1
+S&P 500 rally (exact match)                            5         11          1
+IoT heartbeat (exact match)                           20         41          1
+Latency baseline repeated 4x                          24         49          4
+S&P 500 rally repeated 3x                             15         31          3
+Cross-domain: latency + S&P + IoT                     31         63          3
+------------------------------------------------------------------------------
+TOTAL                                                101        208         13
+
+Operations saved: 195 (93.8%) — 16.00x overall speedup
 ```
 
-```json
-{
-  "uptime_secs": 3600,
-  "total_requests": 5000,
-  "cache_hits": 1750,
-  "hit_rate_pct": 35.0,
-  "tokens_saved": 210000,
-  "skills_learned": 12,
-  "engine": "xdpd-gateway",
-  "version": "0.1.0"
-}
+**PHASE 3 — LLM integration value.** A hypothetical cost-projection scenario, explicitly labeled as such — not a measurement against a real LLM workload. See the root README's "Illustrative" section for the caveat.
+
+**PHASE 4 — Anomaly detection.** Sequences that match a learned shape compress well (high ratio); sequences that deviate don't. All 6 test cases (3 normal, 3 anomalous) classify correctly.
+
+**PHASE 5 — Learned capability table.** Dumps the subroutine table: skill name, instruction count, strength.
+
+**PHASE 6 — Generalization benchmark (the important one).** Trains on exactly one seed sequence per pattern shape, then tests against same-shape sequences it never observed, plus a control group of different shapes it should reject:
+
+```
+Skill hit-rate on unseen same-shape data: 8/8 (100.0%)
+False positives on non-matching shapes: 0/3
 ```
 
-### Health Check
+This is what actually distinguishes XDPD from memorizing a lookup table: a skill compiled from `[0,2,4,6,8]` also recognizes `[100,102,104,106,108]` and `[9000,9002,9004,9006,9008]` — same shape, never observed, still compresses to a single `Call`. See `run_generalization_benchmark()` in `src/main.rs` for the full case list.
 
-```bash
-curl http://localhost:8080/health
-```
+## Related
 
-### Learned Skills
-
-```bash
-curl http://localhost:8080/skills
-```
-
-## Production Use
-
-```bash
-# Point at your real LLM endpoint
-OPENAI_API_KEY=sk-... UPSTREAM_URL=https://api.openai.com/v1/chat/completions cargo run --release
-
-# Custom port
-PORT=3000 cargo run --release
-```
-
-Without `OPENAI_API_KEY`, the gateway runs in simulation mode — useful for testing and demos.
-
-## Why This Matters
-
-Every LLM API call costs money. When users ask the same types of questions:
-- "Summarize this document"
-- "Extract entities from this text"  
-- "Format this as JSON"
-- "Translate this to French"
-
-...the LLM goes through the same reasoning path. XDPD learns these patterns and shortcuts them. A 35% cache hit rate on 50K daily queries saves $135/month on Claude Opus 4.8.
-
-## Architecture
-
-The cache is NOT Redis. It's NOT a vector database. It's the XDPD subroutine table — a growing instruction set that learns patterns and compiles them into reusable subroutines. When the system learns, it adds a word to its language. That word is computational, not textual.
+- [examples/gateway/](gateway/) — a separate demo: an LLM inference proxy that uses XDPD as its cache layer.
