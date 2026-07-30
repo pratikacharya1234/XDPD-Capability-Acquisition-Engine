@@ -3,16 +3,18 @@
 Measures XDPD's template mining against real data with published ground truth,
 and against Drain3 — the established production baseline.
 
-**XDPD currently loses this benchmark, badly. The numbers are below anyway.**
-That is the point of running it: the project's other figures are synthetic, and
-a synthetic win is worth less than a measured loss you can act on.
+**XDPD now ties Drain3 on the two datasets it was developed against, and loses
+on all four held-out ones.** Both halves of that sentence are the result.
 
 ## Run it
 
 ```sh
 ./fetch-data.sh                                        # loghub datasets
 cargo run --release -- data/HDFS_2k.log_structured.csv
-cargo run --release -- data/Apache_2k.log_structured.csv
+
+# the baseline, actually run rather than quoted:
+python3 -m venv venv && ./venv/bin/pip install drain3
+./venv/bin/python drain3_baseline.py data/HDFS_2k.log_structured.csv
 ```
 
 Datasets are from [loghub](https://github.com/logpai/loghub), the standard
@@ -25,64 +27,84 @@ demand rather than vendored.
 **Grouping Accuracy (GA)**, as used throughout the log-parsing literature: a
 message counts as correct only when its predicted cluster contains *exactly* the
 same set of messages as its ground-truth cluster. Partial overlap scores zero,
-which is what makes GA demanding — and why XDPD's partial coverage scores so
-poorly.
+which is what makes GA demanding.
 
-Both systems were measured with the identical GA implementation on the identical
-`Content` field.
+Both systems are measured with the same GA definition on the same `Content`
+field — `grouping_accuracy` in `src/main.rs` and in `drain3_baseline.py` are
+line-for-line equivalent.
 
-## Results — measured 2026-07-30, xdpd 0.2.1 + phases 1-6
+## Results — measured 2026-07-30, xdpd 0.2.1 + phases 1-7
 
-| dataset | lines | true types | XDPD GA | **Drain3 GA** | XDPD templates | XDPD lines claimed | XDPD compression |
-|---|---|---|---|---|---|---|---|
-| HDFS_2k | 2000 | 14 | **32.4%** | **99.8%** | 6 | 753 / 2000 | 1.45x |
-| Apache_2k | 2000 | 6 | **1.6%** | **100.0%** | 5 | 272 / 2000 | 1.18x |
+| dataset | true types | XDPD GA | **Drain3 GA** | held out? |
+|---|---|---|---|---|
+| HDFS_2k | 14 | 99.7% | **99.8%** | no |
+| Apache_2k | 6 | **100.0%** | **100.0%** | no |
+| BGL_2k | 120 | 91.2% | **96.9%** | yes |
+| Zookeeper_2k | 50 | 93.3% | **96.7%** | yes |
+| OpenSSH_2k | 27 | 52.1% | **71.8%** | yes |
+| Linux_2k | 118 | 17.9% | **68.4%** | yes |
+| **mean** | | **75.7%** | **88.9%** | |
 
-Learn time: 7.4ms (HDFS) / 3.6ms (Apache) for 2000 lines. Drain3 parse time was
-4.4ms / 4.1ms, so throughput is comparable; accuracy is not.
+**Read the "held out" column before the accuracy column.** HDFS and Apache are
+the datasets the template-generalization work in `Learner::observe` was
+developed against, and parity there is not evidence of anything. The four
+datasets that were never looked at during development are, and XDPD loses all
+four — narrowly on BGL and Zookeeper, heavily on Linux.
 
-**Lossless reproduction: OK on both.** Every line claimed by a template was
-reproduced byte-for-byte from that template plus its captured parameters. This is
-the one invariant the design rests on, and the benchmark exits non-zero if it
-ever fails. It held on 100% of claimed lines.
+Previous measurement, before template generalization landed: **32.4% (HDFS) /
+1.6% (Apache)**. The mechanism below is what moved those.
 
-### Context for the compression figures
+**Lossless reproduction: OK on every dataset.** Every line claimed by a template
+was reproduced byte-for-byte from that template plus its captured parameters.
+This is the one invariant the design rests on, and the benchmark exits non-zero
+if it ever fails.
 
-1.45x and 1.18x are **program-level ops on real data** — far below the 16x the
-README quotes from synthetic sequences. Both are honest; they measure different
-things. These are the ones to cite for real workloads.
+Compression on HDFS went from 1.45x to **11.90x** program-level ops, and learn
+time is ~6ms per 2000 lines. Drain3 parses the same file in ~4ms, so throughput
+remains comparable.
 
-## Why XDPD loses, with evidence
+## What changed, and why it worked
 
-Three hypotheses were tested and **ruled out**:
+Pairwise alignment marks a position `Fixed` whenever the two records being
+aligned happen to agree there — including positions that vary across the event
+type as a whole. Two problems followed from that, and both are now fixed:
 
-| Hypothesis | Measurement | Verdict |
-|---|---|---|
-| The 16-record alignment window is too short | 91.6% (HDFS) / 98.3% (Apache) of same-type recurrences are ≤16 lines apart | not the cause |
-| Same-length alignment is too restrictive | 13/14 and 6/6 event types have a single token count | not the cause |
-| The 50%-fixed threshold rejects real templates | 0 of 12 and 0 of 6 aligned pairs fall below it | not the cause |
+1. **Templates never generalized.** Each pair froze a *different* set of
+   coincidences, so no two aligned templates shared a signature, so frequency
+   counting never saw a repeat and never compiled anything. `generalize_template`
+   widens an existing skeleton on contact instead — every position that ever
+   varies decays to `Var` — and templates are compiled on first alignment, since
+   alignment already requires two records to exist.
+2. **Templates decayed to death mid-ingest.** `observe` never reinforced
+   anything, so a skill learned early sat at strength 10 and lost 1 per decay
+   tick, hitting the floor about 1000 observations later. A skeleton that keeps
+   explaining incoming records now counts as in use.
 
-One real bug was found and fixed: `align_template` rejected all-`Fixed` results
-as "memorized literals", which discarded event types whose messages are wholly
-constant — two of six on Apache. Fixing it took Apache from 2 to 5 templates and
-107 to 272 claimed lines. GA did not move, because GA needs exact cluster
-equality.
+The second was the larger effect by far: without it HDFS sat at 33.4%, with it
+99.7%.
 
-**The remaining cause is convergence.** A template induced from *one pair* of
-records has `Fixed` slots wherever that pair happened to agree — including
-positions that vary across the event type as a whole. The template is therefore
-over-specific and claims only the subset of lines that share the accident. Pairwise
-alignment produces 14 distinct templates for HDFS's 14 types and 8 for Apache's
-6, so the templates exist; they just never generalize to cover their whole type.
+## Where it still loses, with evidence
 
-### The fix
+Linux_2k is the worst case (17.9% vs 68.4%) and shows the remaining structural
+limit clearly: XDPD's `Template` is **fixed-length**, so one event type whose
+messages differ in token count cannot be one template. Linux has 118 event types
+across highly variable message lengths; HDFS has 14 types where 13 have a single
+token count. HDFS's own residual error is the same shape — event `E4`, whose five
+messages are 6, 14, and 105 tokens long, is the only type XDPD fails to claim.
 
-Refine templates instead of minting them. When a new record nearly matches an
-existing template, generalize that template in place — turn `Fixed` into `Var` at
-the positions where they now disagree — rather than adding a second, differently
-over-specific template. That is what Drain achieves with its cluster tree, and it
-is the change most likely to move GA. It is a redesign of the learning path in
-`Learner::observe`, so it is queued for review, not slipped in here.
+Fixing that means variable-span slots — a slot that absorbs a run of *n* tokens
+rather than exactly one — which is a real change to matching and to param
+capture, not a threshold tweak. It is not queued here; it is written down.
 
-Until that lands, the honest summary is: **XDPD's throughput and losslessness
-hold up on real data; its template accuracy does not compete with Drain3.**
+There is a second, smaller limit with the same flavour. Widening only merges two
+skeletons that still agree on at least half their positions, which is what stops
+unrelated record types collapsing into one match-everything template. A type
+carrying very little constant context — mostly variable fields — can therefore
+settle into two skeletons instead of one, and GA scores both zero. The guard is
+load-bearing, so this is a trade-off to tune with measurements, not a bug to
+remove; `a_template_widens_to_cover_every_position_that_ever_varies` in
+`xdpd/src/lib.rs` pins the current behaviour.
+
+**Honest summary: XDPD's template mining went from unusable to competitive, and
+"competitive" means it still loses to Drain3 on every dataset it was not
+developed against.**

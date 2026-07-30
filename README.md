@@ -22,20 +22,23 @@ Observation Stream -> Pattern Detection -> Subroutine Compilation -> DP Composit
 
 Starts with 5 primitives: `Load`, `Output`, `Seq`, `Call`, `Ret`. All other capabilities are learned.
 
-## Measured on real data — XDPD loses to the incumbents
+## Measured on real data
 
 Read this before the demo numbers below it.
 
-| Benchmark | Dataset | XDPD | Baseline |
+| Benchmark | Data | XDPD | Baseline |
 |---|---|---|---|
-| [Log template mining](examples/logbench/) | loghub HDFS_2k | 32.4% GA | **Drain3 99.8%** |
-| [Log template mining](examples/logbench/) | loghub Apache_2k | 1.6% GA | **Drain3 100.0%** |
-| [Numeric anomaly detection](examples/tsbench/) | NAB, 4 series | 0.748 mean F1 | **rolling z-score 0.962** |
+| [Log template mining](examples/logbench/) | loghub, 2 developed-against | 99.7% / 100.0% GA | Drain3 99.8% / 100.0% |
+| [Log template mining](examples/logbench/) | loghub, 4 **held out** | 63.6% mean GA | **Drain3 83.5% mean** |
+| [Numeric anomaly detection](examples/tsbench/) | NAB, 4 series | 0.774 mean F1 | **rolling z-score 0.962** |
 
-Both benchmarks are runnable and fetch their own data. No measured axis
-currently favours XDPD over a specialized incumbent — see
-[docs/ARCHITECTURE.md §I.5](docs/ARCHITECTURE.md) for what that does and does
-not leave standing.
+Both benchmarks are runnable and fetch their own data; the Drain3 baseline is
+run, not quoted. Template mining is competitive on the datasets it was developed
+against and **loses on every held-out one** — the second row is the one that
+means something. Numeric anomaly detection loses outright.
+
+See [docs/ARCHITECTURE.md §I.5](docs/ARCHITECTURE.md) for what that does and
+does not leave standing.
 
 ## Demo Results — synthetic data, not a benchmark
 

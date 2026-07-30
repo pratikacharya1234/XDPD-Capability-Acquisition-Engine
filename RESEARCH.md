@@ -186,8 +186,11 @@ reconstruction on loghub HDFS_2k and Apache_2k (`examples/logbench`):
 
 | | XDPD | Drain3 |
 |---|---|---|
-| Lossless reconstruction | 100% of the 38% / 14% of lines it claims | **100% of 100% of lines** |
-| Grouping accuracy | 32.4% / 1.6% | **99.8% / 100%** |
+| Lossless reconstruction | 100% of the lines it claims | **100% of 100% of lines** |
+| Grouping accuracy, mean over 6 loghub sets | 75.7% | **88.9%** |
+
+Template generalization later took XDPD from 32.4% / 1.6% to 99.7% / 100% on those two sets,
+but it loses all four held-out ones — see `docs/ARCHITECTURE.md` §I.3 for the full table.
 
 Losslessness is still a real property of XDPD. It is simply not scarce, and it must not be sold
 as scarce.

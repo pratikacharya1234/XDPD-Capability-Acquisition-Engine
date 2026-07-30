@@ -96,17 +96,32 @@ concerns **semantic caches** — embedding similarity under a tuned threshold. I
 describe **template miners**, which are already exact and positional. Generalizing it to them
 was an error.
 
-Drain3 was tested for exact positional reconstruction on the same two loghub datasets:
+Drain3 was tested for exact positional reconstruction on the same loghub datasets. Its `<*>`
+wildcards are positionally aligned, structurally equivalent to `Fixed`/`Var` slots, and every
+line rebuilds exactly. So on log template mining XDPD holds **no advantage on any measured
+axis**, losslessness included.
 
-| | XDPD | Drain3 |
-|---|---|---|
-| Lossless reconstruction | 100% **of the 38% / 14% of lines it claims** | **100% of 100% of lines** |
-| Grouping accuracy | 32.4% / 1.6% | **99.8% / 100%** |
-| Parse time, 2000 lines | 7.4 ms | **4.4 ms** |
+**Update, same day — template generalization closed most of the accuracy gap, then held-out
+data reopened it.** Two defects were fixed in `Learner::observe`: pairwise alignment froze
+coincidental agreement and never widened, and templates decayed to death mid-ingest because
+`observe` reinforced nothing. Details and mechanism in `examples/logbench/README.md`.
 
-Drain3's `<*>` wildcards are positionally aligned, structurally equivalent to `Fixed`/`Var`
-slots. Every line rebuilds exactly. So on log template mining XDPD holds **no advantage on any
-measured axis**, losslessness included.
+| dataset | XDPD GA before | XDPD GA after | Drain3 GA | held out? |
+|---|---|---|---|---|
+| HDFS_2k | 32.4% | 99.7% | **99.8%** | no |
+| Apache_2k | 1.6% | **100.0%** | **100.0%** | no |
+| BGL_2k | — | 91.2% | **96.9%** | yes |
+| Zookeeper_2k | — | 93.3% | **96.7%** | yes |
+| OpenSSH_2k | — | 52.1% | **71.8%** | yes |
+| Linux_2k | — | 17.9% | **68.4%** | yes |
+| **mean** | | **75.7%** | **88.9%** | |
+
+Parity on HDFS and Apache is not evidence: those are the two datasets the fix was developed
+against. The four held-out sets are the evidence, and Drain3 wins all four. The remaining gap
+has one identified structural cause — `Template` is fixed-length, so an event type whose
+messages vary in token count cannot be a single template. That is why Linux, with 118 types
+over highly variable lengths, is the worst case, and why HDFS's only miss is the one event
+whose messages run 6, 14, and 105 tokens.
 
 What survives as genuinely distinct — and is **not yet measured**, so it must not be claimed
 until it is:
@@ -128,15 +143,16 @@ arithmetic:
 
 | series | XDPD F1 | z-score F1 |
 |---|---|---|
-| machine_temperature_system_failure | 0.851 | **0.856** |
-| ec2_request_latency_system_failure | 0.510 | **1.000** |
-| ec2_cpu_utilization_5f5533 | 0.642 | **0.999** |
-| nyc_taxi | 0.987 | **0.993** |
-| **mean** | **0.748** | **0.962** |
+| machine_temperature_system_failure | **0.856** | **0.856** |
+| ec2_request_latency_system_failure | 0.545 | **1.000** |
+| ec2_cpu_utilization_5f5533 | 0.704 | **0.999** |
+| nyc_taxi | **0.993** | **0.993** |
+| **mean** | **0.774** | **0.962** |
 
-Won 0 of 4. **Recall was equal on every series** — XDPD found the same anomaly windows — so the
-signal is not blind, it is noisy: precision collapses because it also flags much of the normal
-region.
+Won 0 of 4, tied 2 of 4. **Recall was equal on every series** — XDPD found the same anomaly
+windows — so the signal is not blind, it is noisy: precision collapses because it also flags
+much of the normal region. (Figures re-measured after the template-generalization fix, which
+lifted the mean from 0.748; it did not change the conclusion.)
 
 ### I.5 Where that leaves the project — the strategic finding
 
@@ -145,8 +161,8 @@ on measurement:
 
 | XDPD mechanism | Established equivalent | Result |
 |---|---|---|
-| Template induction by alignment | Drain3 | Loses 32.4% / 1.6% GA vs 99.8% / 100% |
-| Compression ratio as anomaly signal | rolling z-score, NCD | Loses 0.748 vs 0.962 mean F1 |
+| Template induction by alignment | Drain3 | Loses 75.7% vs 88.9% mean GA over 6 datasets; ties on the 2 it was developed against, loses all 4 held out |
+| Compression ratio as anomaly signal | rolling z-score, NCD | Loses 0.774 vs 0.962 mean F1 |
 | `Seq` / arithmetic runs | delta-of-delta encoding (Gorilla, Prometheus) | Solved and shipping; untested here |
 | Lossless positional reconstruction | Drain3 `<*>` templates | Ties in kind, loses on coverage |
 

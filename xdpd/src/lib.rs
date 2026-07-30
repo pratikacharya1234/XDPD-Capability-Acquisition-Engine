@@ -916,6 +916,51 @@ pub fn align_template(a: &[Token], b: &[Token]) -> Option<PatternShape> {
     Some(PatternShape::Template(slots))
 }
 
+/// Widen `old` so it also accepts anything `new` accepts: positions the two
+/// disagree on become `Var`. Returns `None` when they are too dissimilar to be
+/// the same record type, and the widened slots otherwise — which equal `old`
+/// exactly when `old` already covers `new`.
+///
+/// This is what stops pairwise alignment from freezing coincidence. Aligning
+/// two records marks a position `Fixed` whenever those two happen to agree
+/// there, even if the other three hundred records of that type disagree. The
+/// resulting template matches almost nothing, and — because a different pair
+/// freezes a different set of positions — no two such templates share a
+/// signature, so frequency counting never sees a repeat and never compiles
+/// anything at all. Widening on contact converges to the real skeleton instead:
+/// every position that ever varies ends up `Var`, and the move is monotone
+/// (`Fixed` to `Var`, never back), so it terminates.
+fn generalize_template(old: &[Slot], new: &[Slot]) -> Option<Vec<Slot>> {
+    if old.len() != new.len() {
+        return None;
+    }
+    let mut merged = Vec::with_capacity(old.len());
+    let mut agree = 0usize;
+    for (a, b) in old.iter().zip(new) {
+        match (a, b) {
+            (Slot::Fixed(p), Slot::Fixed(q)) if p == q => {
+                agree += 1;
+                merged.push(Slot::Fixed(*p));
+            }
+            // Runs carry structure beyond a single token; widening one to `Var`
+            // would change the span, so a disagreement there is a different
+            // record type rather than a wider version of this one.
+            (Slot::Run { .. }, _) | (_, Slot::Run { .. }) if a != b => return None,
+            (Slot::Run { .. }, _) => {
+                agree += 1;
+                merged.push(a.clone());
+            }
+            _ => merged.push(Slot::Var),
+        }
+    }
+    // Too little in common to be the same record type — and a skeleton that
+    // kept widening past this point would end up matching everything.
+    if agree * 2 < old.len() {
+        return None;
+    }
+    Some(merged)
+}
+
 // ---------------------------------------------------------------------------
 // Composition — Dynamic Programming over skills
 // ---------------------------------------------------------------------------
@@ -1233,9 +1278,14 @@ const STRENGTH_FLOOR: i32 = 0;
 /// Hard cap on table size. The weakest skills go first.
 const MAX_SKILLS: usize = 4096;
 
-/// How many recent raw records are kept for alignment. Each new record is
-/// aligned against these, so this bounds both memory and per-observation work.
+/// How many recent raw records of a *given length* are kept for alignment.
+/// Each new record is aligned only against records of its own length, so this
+/// bounds per-observation work.
 const RECENT_RECORDS: usize = 16;
+
+/// Hard cap on raw records held for alignment across all lengths. Bounds memory
+/// independently of how many distinct record lengths a stream contains.
+const RECENT_TOTAL: usize = 256;
 
 pub struct Learner {
     vm: VM,
@@ -1254,13 +1304,22 @@ pub struct Learner {
     learned_signatures: HashSet<String>,
     /// Tokens accumulated by the streaming API, awaiting `flush()`.
     pending: Vec<Token>,
-    /// The last few raw records, kept only to align new records against.
+    /// The last few raw records, kept only to align new records against,
+    /// bucketed by record length.
     ///
-    /// Alignment is inherently a comparison between two records, so a small
-    /// bounded buffer of raw tokens is unavoidable here. It is working state
-    /// with a hard cap, not storage: nothing accumulates, and the skill table
-    /// is still the only thing that persists.
-    recent: VecDeque<Vec<Token>>,
+    /// Alignment only ever succeeds between records of equal length, so a flat
+    /// FIFO wastes its whole budget whenever record types interleave: a record
+    /// can be pushed out by sixteen unrelated ones before its own kind comes
+    /// round again, and the two never meet. Keeping a short queue per length
+    /// means two records of the same shape align however far apart they arrive.
+    ///
+    /// Working state with a hard cap, not storage: `recent_order` bounds the
+    /// total across all buckets, so nothing accumulates and the skill table is
+    /// still the only thing that persists.
+    recent: HashMap<usize, VecDeque<Vec<Token>>>,
+    /// Lengths of the buckets holding each stored record, oldest first — the
+    /// eviction order that keeps `recent` bounded to `RECENT_TOTAL`.
+    recent_order: VecDeque<usize>,
     /// Observations seen, used only to pace decay ticks.
     ticks: u64,
     config: LearnerConfig,
@@ -1280,7 +1339,8 @@ impl Learner {
             freq: HashMap::new(),
             learned_signatures: HashSet::new(),
             pending: Vec::new(),
-            recent: VecDeque::new(),
+            recent: HashMap::new(),
+            recent_order: VecDeque::new(),
             ticks: 0,
             config,
         }
@@ -1346,6 +1406,58 @@ impl Learner {
     /// is kept only in the window, then discarded.
     ///
     /// Returns names of any newly learned skills.
+    /// Widen an already-learned template so it also covers `shape`.
+    ///
+    /// Returns whether one was found — `true` means the record type is already
+    /// represented (possibly after widening) and `shape` needs no skill of its
+    /// own; `false` means this is a type the table has never seen.
+    fn generalize_learned(&mut self, shape: &PatternShape) -> bool {
+        let PatternShape::Template(new_slots) = shape else {
+            return false;
+        };
+        let hit = self.vm.subroutines().values().find_map(|skill| {
+            match &skill.shape {
+                PatternShape::Template(old) => generalize_template(old, new_slots)
+                    .map(|merged| (skill.name.clone(), old.clone(), merged)),
+                _ => None,
+            }
+        });
+        let Some((name, old_slots, merged)) = hit else {
+            return false;
+        };
+        if merged == old_slots {
+            // Already covers it. A skeleton that keeps explaining incoming
+            // records is being used, whether or not anything has called it yet:
+            // without this, decay kills every template a long ingest learns
+            // early on, because `observe` alone never reinforces anything and
+            // ten decay ticks is all it takes to hit the floor.
+            if let Some(skill) = self.vm.subroutines_mut().get_mut(&name) {
+                skill.strength = skill
+                    .strength
+                    .saturating_add(STRENGTH_ON_USE)
+                    .min(STRENGTH_MAX);
+            }
+            return true;
+        }
+
+        let old_sig = PatternShape::Template(old_slots).encode();
+        let wider = PatternShape::Template(merged);
+        let sig = wider.encode();
+        self.forget_skill(&name);
+        // Deliberately keep the narrow signature marked as learned. `forget_skill`
+        // clears it so a shape can be relearned, which is right when a skill
+        // decayed away — but here it was replaced by something strictly more
+        // general, and letting it come back would undo the widening every time.
+        self.learned_signatures.insert(old_sig);
+
+        if self.learned_signatures.insert(sig.clone()) {
+            let mut skill = Skill::new(format!("skill_{}", sig), wider);
+            skill.signature = sig;
+            self.vm.add_skill(skill);
+        }
+        true
+    }
+
     pub fn observe(&mut self, sequence: &[Token]) -> Vec<String> {
         if sequence.len() < 2 {
             return Vec::new();
@@ -1383,7 +1495,9 @@ impl Learner {
         }
 
         // 3. Templates, by aligning against recent records of the same length.
-        for prev in &self.recent {
+        let bucket = self.recent.entry(sequence.len()).or_default();
+        let mut aligned = Vec::new();
+        for prev in bucket.iter() {
             if let Some(shape) = align_template(prev, sequence) {
                 // A literal earns its place only when nothing structural
                 // already describes this sequence. Otherwise [7,7,7,7] would
@@ -1391,19 +1505,58 @@ impl Learner {
                 if shape.is_literal_template() && !found.is_empty() {
                     continue;
                 }
-                found.insert(shape.encode(), shape);
+                aligned.push(shape);
             }
         }
 
-        if self.recent.len() >= RECENT_RECORDS {
-            self.recent.pop_front();
+        if bucket.len() >= RECENT_RECORDS {
+            bucket.pop_front();
+        } else {
+            self.recent_order.push_back(sequence.len());
         }
-        self.recent.push_back(sequence.to_vec());
+        self.recent
+            .get_mut(&sequence.len())
+            .expect("bucket just created")
+            .push_back(sequence.to_vec());
+
+        // Templates do not go through the frequency threshold. Alignment needs
+        // two records before it can produce a template at all, so the evidence
+        // a threshold exists to demand has already been supplied — while making
+        // a template wait for its *signature* to repeat is the thing that stops
+        // real record types ever being learned, because each pair of records
+        // freezes a different set of coincidences and no two agree.
+        let mut new_skills = Vec::new();
+        for shape in aligned {
+            // Widen an existing skeleton if this is the same record type; only
+            // a genuinely new type earns a skill.
+            if !self.generalize_learned(&shape) {
+                let sig = shape.encode();
+                if self.learned_signatures.insert(sig.clone()) {
+                    let name = format!("skill_{}", sig);
+                    let mut skill = Skill::new(name.clone(), shape);
+                    skill.signature = sig;
+                    self.vm.add_skill(skill);
+                    new_skills.push(name);
+                }
+            }
+        }
+
+        // Evict across buckets once the global budget is spent, so a stream of
+        // many distinct lengths cannot grow this without bound.
+        while self.recent_order.len() > RECENT_TOTAL {
+            if let Some(len) = self.recent_order.pop_front() {
+                if let Some(b) = self.recent.get_mut(&len) {
+                    b.pop_front();
+                    if b.is_empty() {
+                        self.recent.remove(&len);
+                    }
+                }
+            }
+        }
 
         // Count them, and compile any that just crossed the threshold. Only
         // signatures touched here can have crossed it — eviction only lowers
         // counts — so there is no reason to re-scan the whole table.
-        let mut new_skills = Vec::new();
         let mut sigs = Vec::with_capacity(found.len());
         for (sig, shape) in found {
             let entry = self.freq.entry(sig.clone()).or_insert((shape, 0));
@@ -2309,6 +2462,78 @@ mod tests {
         // Different lengths cannot be aligned positionally.
         assert!(align_template(&[1, 2, 3], &[1, 2]).is_none());
         assert!(align_template(&[], &[]).is_none());
+    }
+
+    #[test]
+    fn a_template_widens_to_cover_every_position_that_ever_varies() {
+        // Each *pair* of these agrees somewhere the type as a whole does not:
+        // the first two share status 200, the last two share duration 12.
+        // Pairwise alignment alone freezes those coincidences into a template
+        // that matches almost nothing. The skeleton must widen instead.
+        //
+        // The trailing 88, 99 are the record type's own constant context. They
+        // matter: widening only merges skeletons that still agree on at least
+        // half their positions, so a record type carrying almost no fixed
+        // context — three varying fields out of four — can still settle into
+        // two skeletons rather than one. That guard is what stops unrelated
+        // types collapsing together, and it is the known limit of this method.
+        let records = [
+            vec![71, 8814, 200, 34, 88, 99],
+            vec![71, 2291, 200, 41, 88, 99],
+            vec![71, 9007, 404, 12, 88, 99],
+            vec![71, 5150, 500, 12, 88, 99],
+        ];
+        let mut learner = Learner::with_config(LearnerConfig {
+            min_occurrences: 2,
+            window_size: 100,
+        });
+        for r in &records {
+            learner.observe(r);
+        }
+
+        let templates: Vec<_> = learner
+            .skills()
+            .into_iter()
+            .filter(|s| matches!(s.shape, PatternShape::Template(_)))
+            .collect();
+        assert_eq!(
+            templates.len(),
+            1,
+            "one record type must yield one skeleton, got {:?}",
+            templates.iter().map(|s| &s.shape).collect::<Vec<_>>()
+        );
+
+        // The surviving skeleton covers all four, and still reproduces each
+        // exactly — widening must never cost losslessness.
+        let t = &templates[0];
+        for r in &records {
+            let params = t.shape.matches(r).expect("widened template should match");
+            assert_eq!(run_shape(&t.shape, params), *r);
+        }
+        // ...and it did not widen into a shape that matches anything at all.
+        assert!(t.shape.matches(&[99, 1, 2, 3]).is_none());
+    }
+
+    #[test]
+    fn a_template_that_keeps_matching_survives_a_long_ingest() {
+        // Decay runs on a timer, and `observe` alone used to reinforce nothing,
+        // so a skeleton learned early died mid-stream even while records of its
+        // own type kept arriving — the table forgot exactly what it was seeing.
+        let mut learner = Learner::with_config(LearnerConfig {
+            min_occurrences: 2,
+            window_size: 100,
+        });
+        let ticks_to_starve = (10 / DECAY_AMOUNT as u64 + 2) * DECAY_INTERVAL;
+        for i in 0..ticks_to_starve {
+            learner.observe(&[71, 1000 + i as Token, 200, 34]);
+        }
+
+        let survivor = learner
+            .skills()
+            .into_iter()
+            .find(|s| matches!(s.shape, PatternShape::Template(_)))
+            .expect("a template matched on every observation must not decay away");
+        assert!(survivor.shape.matches(&[71, 4242, 200, 34]).is_some());
     }
 
     #[test]

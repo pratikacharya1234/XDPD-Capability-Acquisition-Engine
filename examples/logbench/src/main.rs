@@ -284,6 +284,31 @@ fn main() {
         }
     );
 
+    if env::var("XDPD_DIAG").is_ok() {
+        println!("\n--- diagnosis: predicted vs true ---");
+        let mut per_true: HashMap<&str, (usize, HashMap<&str, usize>, HashSet<usize>)> =
+            HashMap::new();
+        for (i, t) in truth.iter().enumerate() {
+            let e = per_true.entry(t.as_str()).or_default();
+            e.0 += 1;
+            e.2.insert(tokenized[i].len());
+            *e.1.entry(predicted[i].unwrap_or("<none>")).or_default() += 1;
+        }
+        let mut rows: Vec<_> = per_true.into_iter().collect();
+        rows.sort_by_key(|(_, v)| std::cmp::Reverse(v.0));
+        for (id, (n, by_pred, lens)) in rows {
+            let mut ps: Vec<_> = by_pred.into_iter().collect();
+            ps.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
+            let ps: Vec<String> = ps
+                .iter()
+                .map(|(p, c)| format!("{}={}", p.trim_start_matches("skill_"), c))
+                .collect();
+            let mut ls: Vec<usize> = lens.into_iter().collect();
+            ls.sort_unstable();
+            println!("{:8} n={:5} lens={:?} -> {}", id, n, ls, ps.join(" "));
+        }
+    }
+
     if lossless_failures > 0 {
         // Losslessness is the one property the whole design rests on. A failure
         // here is not a weak score, it is a broken invariant.

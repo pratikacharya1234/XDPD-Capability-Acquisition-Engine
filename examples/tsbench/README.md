@@ -3,7 +3,7 @@
 Tests whether XDPD's compression-ratio anomaly signal beats a rolling z-score on
 real labelled data.
 
-**It does not. Mean F1 0.748 vs 0.962, losing on all four series.** Recorded here
+**It does not. Mean F1 0.774 vs 0.962, winning none and tying two of four series.** Recorded here
 because a measured loss you can act on is worth more than an unmeasured claim.
 
 ## Run it
@@ -41,15 +41,18 @@ pursuing.
   threshold is chosen per detector**, so neither gets a tuning advantage — an
   oracle choice, but symmetrically generous.
 
-## Results — measured 2026-07-30, xdpd 0.2.1 + phases 1-6
+## Results — measured 2026-07-30, xdpd 0.2.1 + phases 1-7
 
 | series | windows | XDPD F1 | z-score F1 | windows found |
 |---|---|---|---|---|
-| machine_temperature_system_failure | 4 | 0.851 | **0.856** | 3/4 vs 3/4 |
-| ec2_request_latency_system_failure | 3 | 0.510 | **1.000** | 3/3 vs 3/3 |
-| ec2_cpu_utilization_5f5533 | 2 | 0.642 | **0.999** | 2/2 vs 2/2 |
-| nyc_taxi | 5 | 0.987 | **0.993** | 5/5 vs 5/5 |
-| **mean** | | **0.748** | **0.962** | won 0 of 4 |
+| machine_temperature_system_failure | 4 | **0.856** | **0.856** | 3/4 vs 3/4 |
+| ec2_request_latency_system_failure | 3 | 0.545 | **1.000** | 3/3 vs 3/3 |
+| ec2_cpu_utilization_5f5533 | 2 | 0.704 | **0.999** | 2/2 vs 2/2 |
+| nyc_taxi | 5 | **0.993** | **0.993** | 5/5 vs 5/5 |
+| **mean** | | **0.774** | **0.962** | won 0, tied 2 of 4 |
+
+Re-measured after the template-generalization fix in `Learner::observe` (see
+`../logbench/README.md`), which lifted the mean from 0.748. The conclusion is unchanged.
 
 ## What the numbers actually say
 
