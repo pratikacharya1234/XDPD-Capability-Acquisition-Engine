@@ -4,10 +4,13 @@
 set -e
 mkdir -p data
 BASE="https://raw.githubusercontent.com/logpai/loghub/master"
-# HDFS and Apache are the two the template logic was developed against; the
-# rest are held out, and are the only honest evidence of how it generalizes.
+# The first six were used while developing and tuning the template logic. The
+# last six were downloaded only after every parameter was frozen, and are the
+# only honest evidence of how this generalizes. Keep that split.
 for pair in "HDFS/HDFS_2k" "Apache/Apache_2k" \
             "BGL/BGL_2k" "Zookeeper/Zookeeper_2k" \
+            "Hadoop/Hadoop_2k" "Spark/Spark_2k" "HealthApp/HealthApp_2k" \
+            "Proxifier/Proxifier_2k" "Mac/Mac_2k" "HPC/HPC_2k" \
             "Linux/Linux_2k" "OpenSSH/OpenSSH_2k"; do
   name=$(basename "$pair")
   echo "fetching $name ..."

@@ -106,34 +106,18 @@ data reopened it.** Two defects were fixed in `Learner::observe`: pairwise align
 coincidental agreement and never widened, and templates decayed to death mid-ingest because
 `observe` reinforced nothing. Details and mechanism in `examples/logbench/README.md`.
 
-| dataset | XDPD GA before | XDPD GA after | Drain3 GA | held out? |
-|---|---|---|---|---|
-| HDFS_2k | 32.4% | 99.7% | **99.8%** | no |
-| Apache_2k | 1.6% | **100.0%** | **100.0%** | no |
-| BGL_2k | — | 91.2% | **96.9%** | yes |
-| Zookeeper_2k | — | 93.3% | **96.7%** | yes |
-| OpenSSH_2k | — | 52.1% | **71.8%** | yes |
-| Linux_2k | — | 17.9% | **68.4%** | yes |
-| **mean** | | **75.7%** | **88.9%** | |
+| evaluation | XDPD mean GA | Drain3 mean GA |
+|---|---|---|
+| 6 sets downloaded after parameters were frozen | 62.1% | **65.5%** |
+| 6 development sets (optimistic by construction) | 86.6% | **88.9%** |
 
-Parity on HDFS and Apache is not evidence: those are the two datasets the fix was developed
-against. The four held-out sets are the evidence, and Drain3 wins all four. The remaining gap
-has one identified structural cause — `Template` is fixed-length, so an event type whose
-messages vary in token count cannot be a single template. That is why Linux, with 118 types
-over highly variable lengths, is the worst case, and why HDFS's only miss is the one event
-whose messages run 6, 14, and 105 tokens.
+XDPD wins 2 of 12 (Proxifier +50.1, OpenSSH +0.7), ties 1, loses 9. Full per-dataset
+tables and the mechanism in `examples/logbench/README.md`.
 
-What survives as genuinely distinct — and is **not yet measured**, so it must not be claimed
-until it is:
-
-1. **No record boundaries.** Drain3 is line-oriented: one template per line. XDPD covers a
-   continuous stream with many skills at arbitrary offsets via DP composition. Where there are
-   no records to cluster, Drain3 does not apply.
-2. **Algebraic primitives.** `Seq` expresses an arithmetic progression in one instruction.
-   Grammar induction and template mining capture *repetition*, not *progression*: a counter or
-   ramp costs them a rule per step. This is a representational difference, not a tuning one.
-3. **Deployment.** ~1000 lines of Rust, zero dependencies, viable in WASM and on
-   microcontrollers. Drain3 needs a Python runtime. Real, but packaging rather than algorithm.
+An earlier revision of this section claimed the residual gap was caused by `Template`
+being fixed-length. **That was wrong and is retracted**: zero event types in Linux, BGL
+or OpenSSH span multiple token counts. The fixed-length limit is real but small; the
+gap's actual causes on HPC and Hadoop are undiagnosed.
 
 ### I.4 The numeric-stream direction was measured too, and also loses
 
@@ -147,7 +131,7 @@ arithmetic:
 | ec2_request_latency_system_failure | 0.545 | **1.000** |
 | ec2_cpu_utilization_5f5533 | 0.704 | **0.999** |
 | nyc_taxi | **0.993** | **0.993** |
-| **mean** | **0.774** | **0.962** |
+| **mean** | **0.772** | **0.962** |
 
 Won 0 of 4, tied 2 of 4. **Recall was equal on every series** — XDPD found the same anomaly
 windows — so the signal is not blind, it is noisy: precision collapses because it also flags
@@ -161,13 +145,15 @@ on measurement:
 
 | XDPD mechanism | Established equivalent | Result |
 |---|---|---|
-| Template induction by alignment | Drain3 | Loses 75.7% vs 88.9% mean GA over 6 datasets; ties on the 2 it was developed against, loses all 4 held out |
-| Compression ratio as anomaly signal | rolling z-score, NCD | Loses 0.774 vs 0.962 mean F1 |
+| Template induction by alignment | Drain3 | Loses 62.1% vs 65.5% mean GA on 6 sets measured with parameters frozen first; wins 2 of 12 datasets |
+| Compression ratio as anomaly signal | rolling z-score, NCD | Loses 0.772 vs 0.962 mean F1 |
 | `Seq` / arithmetic runs | delta-of-delta encoding (Gorilla, Prometheus) | Solved and shipping; untested here |
 | Lossless positional reconstruction | Drain3 `<*>` templates | Ties in kind, loses on coverage |
 
-**No measured axis currently favours XDPD over a specialized incumbent.** That is the honest
-state, and it should be the last word until a measurement says otherwise.
+**One measured axis now favours XDPD: it beats Drain3 on 2 of 12 loghub datasets, decisively on
+Proxifier (52.6% vs 2.5%), where Drain's prefix tree collapses and XDPD's exhaustive
+same-length comparison does not.** On the mean it still loses, and on numeric anomaly detection
+it loses outright. The honest state is *competitive in places, ahead nowhere on average*.
 
 What remains real:
 

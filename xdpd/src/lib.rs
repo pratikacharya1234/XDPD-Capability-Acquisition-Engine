@@ -916,51 +916,6 @@ pub fn align_template(a: &[Token], b: &[Token]) -> Option<PatternShape> {
     Some(PatternShape::Template(slots))
 }
 
-/// Widen `old` so it also accepts anything `new` accepts: positions the two
-/// disagree on become `Var`. Returns `None` when they are too dissimilar to be
-/// the same record type, and the widened slots otherwise — which equal `old`
-/// exactly when `old` already covers `new`.
-///
-/// This is what stops pairwise alignment from freezing coincidence. Aligning
-/// two records marks a position `Fixed` whenever those two happen to agree
-/// there, even if the other three hundred records of that type disagree. The
-/// resulting template matches almost nothing, and — because a different pair
-/// freezes a different set of positions — no two such templates share a
-/// signature, so frequency counting never sees a repeat and never compiles
-/// anything at all. Widening on contact converges to the real skeleton instead:
-/// every position that ever varies ends up `Var`, and the move is monotone
-/// (`Fixed` to `Var`, never back), so it terminates.
-fn generalize_template(old: &[Slot], new: &[Slot]) -> Option<Vec<Slot>> {
-    if old.len() != new.len() {
-        return None;
-    }
-    let mut merged = Vec::with_capacity(old.len());
-    let mut agree = 0usize;
-    for (a, b) in old.iter().zip(new) {
-        match (a, b) {
-            (Slot::Fixed(p), Slot::Fixed(q)) if p == q => {
-                agree += 1;
-                merged.push(Slot::Fixed(*p));
-            }
-            // Runs carry structure beyond a single token; widening one to `Var`
-            // would change the span, so a disagreement there is a different
-            // record type rather than a wider version of this one.
-            (Slot::Run { .. }, _) | (_, Slot::Run { .. }) if a != b => return None,
-            (Slot::Run { .. }, _) => {
-                agree += 1;
-                merged.push(a.clone());
-            }
-            _ => merged.push(Slot::Var),
-        }
-    }
-    // Too little in common to be the same record type — and a skeleton that
-    // kept widening past this point would end up matching everything.
-    if agree * 2 < old.len() {
-        return None;
-    }
-    Some(merged)
-}
-
 // ---------------------------------------------------------------------------
 // Composition — Dynamic Programming over skills
 // ---------------------------------------------------------------------------
@@ -1273,6 +1228,12 @@ const DECAY_AMOUNT: i32 = 1;
 const STRENGTH_ON_USE: i32 = 2;
 /// Ceiling, so a hot skill cannot become permanently immortal.
 const STRENGTH_MAX: i32 = 100;
+/// How many fixed positions one record may turn variable. Bounds how fast a
+/// skeleton can generalize, which is what keeps a different record type from
+/// dissolving it in a single step.
+
+const WIDEN_NUM: usize = 1;
+const WIDEN_DEN: usize = 4;
 /// At or below this, a skill is forgotten.
 const STRENGTH_FLOOR: i32 = 0;
 /// Hard cap on table size. The weakest skills go first.
@@ -1286,6 +1247,14 @@ const RECENT_RECORDS: usize = 16;
 /// Hard cap on raw records held for alignment across all lengths. Bounds memory
 /// independently of how many distinct record lengths a stream contains.
 const RECENT_TOTAL: usize = 256;
+
+/// How much of a record a skeleton must already pin down before the record is
+/// treated as another instance of that type, as a fraction of record length.
+/// Too high and one record type shatters into several skeletons; too low and
+/// unrelated types collapse into one that matches everything. Expressed as a
+/// ratio to keep the comparison in integers.
+const TEMPLATE_SIM_NUM: usize = 2;
+const TEMPLATE_SIM_DEN: usize = 5;
 
 pub struct Learner {
     vm: VM,
@@ -1406,41 +1375,92 @@ impl Learner {
     /// is kept only in the window, then discarded.
     ///
     /// Returns names of any newly learned skills.
-    /// Widen an already-learned template so it also covers `shape`.
+    /// Fit a record into the skeleton that already describes its type, widening
+    /// that skeleton wherever the record disagrees with it.
     ///
-    /// Returns whether one was found — `true` means the record type is already
-    /// represented (possibly after widening) and `shape` needs no skill of its
-    /// own; `false` means this is a type the table has never seen.
-    fn generalize_learned(&mut self, shape: &PatternShape) -> bool {
-        let PatternShape::Template(new_slots) = shape else {
+    /// Returns whether a home was found. `false` means no learned template is
+    /// close enough and the record has to seed a new one by alignment.
+    ///
+    /// Judging the record against the *template* is what makes this converge,
+    /// and it is the difference between competing with Drain and not. Comparing
+    /// two templates to each other — the obvious move — measures agreement that
+    /// shrinks as they widen, so the moment a skeleton has generalized enough to
+    /// be useful it stops accepting anything and its record type shatters across
+    /// several skeletons. Grouping accuracy scores every one of those zero.
+    fn absorb_record(&mut self, seq: &[Token]) -> bool {
+        let mut best: Option<(String, usize, Vec<Slot>)> = None;
+        for skill in self.vm.subroutines().values() {
+            let PatternShape::Template(slots) = &skill.shape else {
+                continue;
+            };
+            // Run slots carry a span beyond one token; widening one would change
+            // the shape's length, so leave those templates to exact matching.
+            if slots.len() != seq.len() || slots.iter().any(|s| s.span() != 1) {
+                continue;
+            }
+            let hits = slots
+                .iter()
+                .zip(seq)
+                .filter(|(s, &t)| matches!(s, Slot::Fixed(v) if *v == t))
+                .count();
+            if hits * TEMPLATE_SIM_DEN < seq.len() * TEMPLATE_SIM_NUM {
+                continue;
+            }
+            // Widening is bounded per record. Another instance of the same type
+            // disagrees with its skeleton in a *few* places — one field that
+            // turned out to vary. A record that contradicts many fixed
+            // positions at once is a different type that happens to share a
+            // prefix, and letting it in is expensive out of all proportion:
+            // grouping accuracy demands exact set equality, so a single
+            // contaminating line scores a four-hundred-line cluster zero.
+            //
+            // `Received disconnect from IP: 11: Bye Bye [preauth]` and
+            // `Received disconnect from IP: 11: disconnected by user` are the
+            // real case — same length, same first five tokens, different events.
+            // Similarity alone cannot separate them; how much the skeleton has
+            // to give up to accept the record can.
+            let contradictions = slots
+                .iter()
+                .zip(seq)
+                .filter(|(s, &t)| matches!(s, Slot::Fixed(v) if *v != t))
+                .count();
+            if contradictions * WIDEN_DEN > seq.len() * WIDEN_NUM {
+                continue;
+            }
+            if best.as_ref().is_some_and(|b| hits <= b.1) {
+                continue;
+            }
+            let merged = slots
+                .iter()
+                .zip(seq)
+                .map(|(s, &t)| match s {
+                    Slot::Fixed(v) if *v == t => Slot::Fixed(*v),
+                    Slot::Fixed(_) => Slot::Var,
+                    other => other.clone(),
+                })
+                .collect();
+            best = Some((skill.name.clone(), hits, merged));
+        }
+
+        let Some((name, _, merged)) = best else {
             return false;
         };
-        let hit = self.vm.subroutines().values().find_map(|skill| {
-            match &skill.shape {
-                PatternShape::Template(old) => generalize_template(old, new_slots)
-                    .map(|merged| (skill.name.clone(), old.clone(), merged)),
-                _ => None,
-            }
-        });
-        let Some((name, old_slots, merged)) = hit else {
+        let Some(skill) = self.vm.subroutines_mut().get_mut(&name) else {
             return false;
         };
-        if merged == old_slots {
-            // Already covers it. A skeleton that keeps explaining incoming
-            // records is being used, whether or not anything has called it yet:
-            // without this, decay kills every template a long ingest learns
-            // early on, because `observe` alone never reinforces anything and
-            // ten decay ticks is all it takes to hit the floor.
-            if let Some(skill) = self.vm.subroutines_mut().get_mut(&name) {
-                skill.strength = skill
-                    .strength
-                    .saturating_add(STRENGTH_ON_USE)
-                    .min(STRENGTH_MAX);
-            }
+        // A skeleton that keeps explaining incoming records is in use, whether
+        // or not anything has called it. Without this, decay kills every
+        // template a long ingest learns early: `observe` reinforces nothing and
+        // ten decay ticks is all it takes to reach the floor.
+        skill.strength = skill
+            .strength
+            .saturating_add(STRENGTH_ON_USE)
+            .min(STRENGTH_MAX);
+        if skill.shape == PatternShape::Template(merged.clone()) {
             return true;
         }
 
-        let old_sig = PatternShape::Template(old_slots).encode();
+        let old_sig = skill.signature.clone();
         let wider = PatternShape::Template(merged);
         let sig = wider.encode();
         self.forget_skill(&name);
@@ -1449,7 +1469,6 @@ impl Learner {
         // decayed away — but here it was replaced by something strictly more
         // general, and letting it come back would undo the widening every time.
         self.learned_signatures.insert(old_sig);
-
         if self.learned_signatures.insert(sig.clone()) {
             let mut skill = Skill::new(format!("skill_{}", sig), wider);
             skill.signature = sig;
@@ -1494,7 +1513,10 @@ impl Learner {
             found.insert(pattern.signature(), pattern.shape());
         }
 
-        // 3. Templates, by aligning against recent records of the same length.
+        // 3. Templates. A record that an existing skeleton already describes
+        // goes there, widening it; only a record no skeleton recognizes falls
+        // through to alignment to seed a new one.
+        let absorbed = self.absorb_record(sequence);
         let bucket = self.recent.entry(sequence.len()).or_default();
         let mut aligned = Vec::new();
         for prev in bucket.iter() {
@@ -1526,18 +1548,20 @@ impl Learner {
         // real record types ever being learned, because each pair of records
         // freezes a different set of coincidences and no two agree.
         let mut new_skills = Vec::new();
-        for shape in aligned {
-            // Widen an existing skeleton if this is the same record type; only
-            // a genuinely new type earns a skill.
-            if !self.generalize_learned(&shape) {
-                let sig = shape.encode();
-                if self.learned_signatures.insert(sig.clone()) {
-                    let name = format!("skill_{}", sig);
-                    let mut skill = Skill::new(name.clone(), shape);
-                    skill.signature = sig;
-                    self.vm.add_skill(skill);
-                    new_skills.push(name);
-                }
+        // Alignment only ever *seeds* skeletons now. Letting it also widen the
+        // ones already learned is what lets a lone record of some other type
+        // dissolve a big skeleton: `absorb_record` refuses it for contradicting
+        // too much, then alignment pairs it with a neighbour of the type it is
+        // contaminating and merges the result straight back in through the side
+        // door. Records join skeletons in exactly one place, under one rule.
+        for shape in aligned.into_iter().take(if absorbed { 0 } else { usize::MAX }) {
+            let sig = shape.encode();
+            if self.learned_signatures.insert(sig.clone()) {
+                let name = format!("skill_{}", sig);
+                let mut skill = Skill::new(name.clone(), shape);
+                skill.signature = sig;
+                self.vm.add_skill(skill);
+                new_skills.push(name);
             }
         }
 

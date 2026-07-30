@@ -28,14 +28,14 @@ Read this before the demo numbers below it.
 
 | Benchmark | Data | XDPD | Baseline |
 |---|---|---|---|
-| [Log template mining](examples/logbench/) | loghub, 2 developed-against | 99.7% / 100.0% GA | Drain3 99.8% / 100.0% |
-| [Log template mining](examples/logbench/) | loghub, 4 **held out** | 63.6% mean GA | **Drain3 83.5% mean** |
-| [Numeric anomaly detection](examples/tsbench/) | NAB, 4 series | 0.774 mean F1 | **rolling z-score 0.962** |
+| [Log template mining](examples/logbench/) | loghub, 6 sets, **parameters frozen first** | 62.1% mean GA | **Drain3 65.5%** |
+| [Log template mining](examples/logbench/) | loghub, 6 development sets | 86.6% mean GA | **Drain3 88.9%** |
+| [Numeric anomaly detection](examples/tsbench/) | NAB, 4 series | 0.772 mean F1 | **rolling z-score 0.962** |
 
 Both benchmarks are runnable and fetch their own data; the Drain3 baseline is
-run, not quoted. Template mining is competitive on the datasets it was developed
-against and **loses on every held-out one** — the second row is the one that
-means something. Numeric anomaly detection loses outright.
+run, not quoted. Template mining wins 2 of 12 datasets and loses the mean by 3.4
+points on the clean evaluation — a large improvement over the 32.4% / 1.6% it
+started at, and still not a win. Numeric anomaly detection loses outright.
 
 See [docs/ARCHITECTURE.md §I.5](docs/ARCHITECTURE.md) for what that does and
 does not leave standing.
@@ -141,7 +141,7 @@ cd examples/gateway && cargo run --release
 | [RESEARCH.md](RESEARCH.md) | Gap analysis, research findings, hypothesis, honest limitations |
 | [CHANGELOG.md](CHANGELOG.md) | Version history — what actually changed and why |
 | [examples/README.md](examples/README.md) | Demo walkthrough with full output |
-| [examples/logbench/](examples/logbench/) | Log template mining vs Drain3 on loghub — measured, XDPD loses |
+| [examples/logbench/](examples/logbench/) | Log template mining vs Drain3 on 12 loghub datasets — measured, XDPD wins 2 |
 | [examples/tsbench/](examples/tsbench/) | Anomaly detection vs rolling z-score on NAB — measured, XDPD loses |
 | [examples/gateway/](examples/gateway/) | LLM inference proxy demo — runnable, not production-hardened |
 | [docs.rs/xdpd](https://docs.rs/xdpd) | API documentation |

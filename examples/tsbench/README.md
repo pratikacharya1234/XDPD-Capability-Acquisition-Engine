@@ -3,7 +3,7 @@
 Tests whether XDPD's compression-ratio anomaly signal beats a rolling z-score on
 real labelled data.
 
-**It does not. Mean F1 0.774 vs 0.962, winning none and tying two of four series.** Recorded here
+**It does not. Mean F1 0.772 vs 0.962, winning no series.** Recorded here
 because a measured loss you can act on is worth more than an unmeasured claim.
 
 ## Run it
@@ -49,7 +49,7 @@ pursuing.
 | ec2_request_latency_system_failure | 3 | 0.545 | **1.000** | 3/3 vs 3/3 |
 | ec2_cpu_utilization_5f5533 | 2 | 0.704 | **0.999** | 2/2 vs 2/2 |
 | nyc_taxi | 5 | **0.993** | **0.993** | 5/5 vs 5/5 |
-| **mean** | | **0.774** | **0.962** | won 0, tied 2 of 4 |
+| **mean** | | **0.772** | **0.962** | won 0 of 4 |
 
 Re-measured after the template-generalization fix in `Learner::observe` (see
 `../logbench/README.md`), which lifted the mean from 0.748. The conclusion is unchanged.
