@@ -41,7 +41,7 @@ pursuing.
   threshold is chosen per detector**, so neither gets a tuning advantage — an
   oracle choice, but symmetrically generous.
 
-## Results — measured 2026-07-30, xdpd 0.2.1 + phases 1-7
+## Results — measured 2026-07-30, xdpd 0.3.0
 
 | series | windows | XDPD F1 | z-score F1 | windows found |
 |---|---|---|---|---|

@@ -87,23 +87,6 @@ assert_eq!(ops, 1);
 Full table (including the control group and how each case is constructed)
 is in PHASE 6 of `examples/src/main.rs` — `cd examples && cargo run --release`.
 
-### Illustrative: LLM cost projection (not measured)
-
-The numbers below are a hypothetical scenario computed from three assumed
-inputs — 120 tokens per matched reasoning pattern, 50,000 queries/day, a
-25% repeat rate — not a measurement against a real LLM workload. They
-model what the compression ratio above *could* be worth if XDPD sat in
-front of an LLM and those assumptions held; treat them as a starting point
-for your own numbers, not a benchmark.
-
-| LLM Model | Per 1M Tokens | Monthly Saved (hypothetical) |
-|---|---|---|
-| GPT-5.5 Instant | $0.15 / $0.60 | $6.75 |
-| Claude Haiku 4.5 | $1.00 / $5.00 | $45.00 |
-| GPT-5.6 Sol | $2.50 / $10.00 | $112.50 |
-| Claude Sonnet 5 | $3.00 / $15.00 | $135.00 |
-| Claude Opus 4.8 | $5.00 / $25.00 | $225.00 |
-
 ## Quick Start
 
 ```rust

@@ -1,6 +1,6 @@
-# XDPD Architecture — v0.3 Target
+# XDPD Architecture
 
-**Current shipped**: 0.2.1 · **This document specifies**: 0.3.0
+**Current shipped**: 0.3.0 · **This document describes**: 0.3.0
 **Research basis**: live literature and market review, July 2026 (Part 0). Sources at the end.
 **Rule for this document**: every claim is tagged `[PROVEN]`, `[CONTESTED]`, `[OPEN]`, or
 `[OURS-UNVERIFIED]`. Parts II–III are verified against `xdpd/src/lib.rs` by reading it.
@@ -165,29 +165,42 @@ What remains real:
 - **The artifact itself.** A working non-neural learning engine with an honest benchmark trail is
   a strong research and educational contribution. That framing does not require beating anyone.
 
-What should **not** happen: another benchmark chosen because it might finally produce a win. Two
-have been run against fair baselines and both lost. A third picked for winnability is how the
-project stops being trustworthy.
+What should **not** happen: another benchmark chosen because it might finally produce a win. The
+two that exist were run against fair baselines and the log one was then improved until it wins 2
+of 12 datasets — that is legitimate, because the benchmark was fixed first and the improvement
+was measured on datasets fetched afterwards. Picking a *third* benchmark for winnability is a
+different act, and it is how the project stops being trustworthy.
+
+The discipline that made the improvement real is worth naming, because it is repeatable: fix the
+metric, run the incumbent yourself rather than quoting it, diagnose before changing anything, and
+download the evaluation data only after the parameters are frozen. The one change made from a
+guess rather than a measurement moved grouping accuracy *backwards*, 32.4% to 22.1%.
 
 ---
 
-## Part II — Current Architecture (0.2.1, verified against code)
+## Part II — Current Architecture (0.3.0, verified against code)
 
 ```
   DOMAIN ADAPTER (caller's job)  ->  Vec<Token = u32>
   ══════════════════ crate boundary ══════════════════
   DATA PLANE
-    Learner::observe(&[Token])                                    lib:716
-      window (bounded FIFO) -> detect_pattern() per entry         lib:548
-      freq-count by Pattern::signature() -> compile Pattern::shape()
-    compose(&skills, target) -> (Vec<Instr>, cost)                lib:591
+    Learner::observe(&[Token])   (or observe_token/flush to stream)
+      1. detect_pattern()  — whole-sequence Constant/Arithmetic/Repeat
+      2. scan_runs()       — runs buried anywhere inside the sequence
+      3. absorb_record()   — fit into an existing skeleton, widening it,
+                             budget: <= 1/4 of its Fixed positions per record
+         else align_template() against recent records of the same length,
+              seeding a new skeleton
+      freq-count by signature for (1) and (2); templates compile on first
+      alignment, since alignment already required two records
+    compose(&skills, target) -> (Vec<Instr>, cost)
       DP per position: naive emit (2 ops) vs Call (1 op)
-      candidate test: PatternShape::matches()                     lib:220
-    VM::run()  |  Load · Output · Seq · Call(name,params) · Ret    lib:367
+      candidates narrowed by MatchKey probe, verified by PatternShape::matches()
+    VM::run()  |  Load · Output · Seq · Call(name,params) · Ret
   CONTROL PLANE — the only memory
     VM.subroutines: HashMap<String, Skill>                        lib:291
     Learner.learned_signatures: HashSet<String>                   lib:690
-    save/load — XDPD_SKILLS_V1, TSV, one skill per line           lib:485
+    save/load — XDPD_SKILLS_V2, TSV, one skill per line (V1 still loads)
 ```
 
 **The generalization split** — the one thing that makes this more than a lookup table:
@@ -214,25 +227,40 @@ instructions (`lib:263`), equal to naive emission. Every README headline is prog
 
 ---
 
-## Part III — Where 0.2.1 Actually Binds
+## Part III — Where 0.3.0 Actually Binds
 
-Found by reading the implementation. Ordered by how hard they block v0.3.
+Rewritten for 0.3.0. The nine constraints listed here for 0.2.1 were the plan that became
+phases 1-7; most are now closed and are recorded below rather than deleted, because the list is
+the project's own record of what it said and whether it delivered.
 
-| # | Constraint | Location | Consequence |
-|---|---|---|---|
-| 1 | **`detect_pattern` is whole-sequence-or-nothing.** A 50-token constant run followed by noise returns `None`. | `lib:548` | The caller must pre-segment; measured hit rate is partly a property of the caller's slicing. `compose()` already segments its target — only *learning* doesn't. |
-| 2 | **No variable slots.** `Constant`/`Arithmetic`/`Repeat` cannot express "same message, different ID". | `lib:193` | **XDPD cannot match a real log line or a real tool call today.** This is the single hardest blocker on every use case in Part IV. |
-| 3 | `observe()` re-runs detection over the whole window per call; `Vec::remove(0)` memmoves it. | `lib:723,728` | O(W·n) + O(W) per observation. The wall a streaming API hits. |
-| 4 | **`strength` and `uses` are dead fields.** `strength` init 10, never changed; `uses` never incremented. | `lib:74` | Table grows monotonically. `learned_signatures` is a *second* unbounded structure; evict without pruning it and shapes become permanently unlearnable. |
-| 5 | `compose()` scans every skill at every position, with a `clone()` per improving candidate. | `lib:617` | O(n·\|S\|). Fine at 3 skills, dominant at 10k. |
-| 6 | **`Call` silently no-ops on an unknown skill name** (`if let Some` with no `else`). | `lib:349` | Emits nothing, reports success. Unreachable today; a live correctness hazard the moment tables are synced or loaded mismatched. |
-| 7 | `Call` recursion has no depth bound (`step()` recurses into `while self.step() {}`). | `lib:354` | Flat shapes make depth 1 today; hierarchy makes it a stack-overflow surface. |
-| 8 | `check_anomaly` divides by `learned`, which is 0 for an empty sequence. | `lib:784` | Returns `inf`. |
-| 9 | **The gateway example does not put XDPD on the hit path.** Cache is `hash_bytes(prompt) -> String`; the learner only `observe()`s. | `gateway/main.rs:225,231,246` | It demonstrates deployment shape, not mechanism. Every "structural cache" claim rests on unbuilt work. |
+### Closed in 0.3.0
 
-Pinned invariants (tests in `lib.rs`): shape generalization across values, constant dedup by
-shape, restart round-trip preserving generalization, format rejection, compression speedup,
-known-vs-unknown anomaly separation.
+| Was | Closed by |
+|---|---|
+| `detect_pattern` was whole-sequence-or-nothing — a run buried in noise returned `None` | `scan_runs` finds maximal non-overlapping runs anywhere inside a sequence |
+| **No variable slots** — "XDPD cannot match a real log line today" | `PatternShape::Template` with `Fixed`/`Var`/`Run` slots. It now matches real log lines at 62.1% mean grouping accuracy on held-out loghub data |
+| `observe()` re-ran detection over the whole window per call | Frequency counts maintained incrementally, `VecDeque` instead of `Vec::remove(0)` |
+| `strength` and `uses` were dead fields; the table grew monotonically | Decay, reinforcement on use *and* on continuing to explain incoming records, `MAX_SKILLS` cap, `forget_skill` clearing `learned_signatures` too |
+| `compose()` scanned every skill at every position | `MatchKey` hash probe narrows candidates before `matches()` verifies |
+| `Call` silently no-ops on an unknown skill name | Reports an error and halts execution; `last_error()` exposes it |
+| `Call` recursion had no depth bound | Bounded, with a test that depth stays balanced |
+| `check_anomaly` divided by zero on an empty sequence | Returns a finite value |
+
+### Open
+
+| # | Constraint | Consequence |
+|---|---|---|
+| 1 | **`Template` is fixed-length.** A record type whose messages differ in token count cannot be one template. | Bounds accuracy on datasets with variable-length events. Note this did *not* explain the Linux gap — zero event types there span multiple lengths — so it is real but smaller than once claimed. |
+| 2 | **The widening budget is a single global constant** (a quarter of a skeleton's positions). Sweeping it moved Linux between 17.9% and 63.1% and OpenSSH between 51.8% and 72.5%, in opposite directions. | One number cannot be right for every log shape. Per-skeleton adaptation is the obvious next idea and is unbuilt and unmeasured. |
+| 3 | **HPC (-29.7) and Hadoop (-27.5) are undiagnosed.** | The two largest remaining gaps, cause unknown. Diagnose before changing anything: the one change made in this project from a guess rather than a measurement moved accuracy backwards. |
+| 4 | **`absorb_record` scans every learned template of the record's length.** | O(\|S\|) per observation. Fine at the table sizes measured; unmeasured at 10k skeletons. |
+| 5 | **The gateway example does not put XDPD on the hit path.** The cache is `hash_bytes(prompt) -> String`; the learner only `observe()`s. | It demonstrates deployment shape, not mechanism. Every "structural cache" claim still rests on unbuilt work. |
+| 6 | **Numeric anomaly scoring has good recall and poor precision** — 0.772 vs a rolling z-score's 0.962 mean F1 on NAB. | Usable as a cheap screen, not as a detector. Unimproved this cycle. |
+
+Pinned invariants (55 tests in `lib.rs`): shape generalization across values, template widening
+and its guard, losslessness across varying values, restart round-trip, v1 format still loading,
+streaming equivalence to batch, bounded pending buffer and table, decay and relearning,
+composition determinism and exactness, anomaly edge cases.
 
 ---
 
@@ -365,7 +393,7 @@ Dependency order. Every criterion is a real dataset or a real capability, not a 
 | 8 | Telemetry integration (IV.6 #1) | Volume reduction on **captured** telemetry vs OTel dedup baseline, counts preserved |
 
 **Release gate.** No claim ships without a named dataset and a reproducible command. The
-0.2.1 numbers (16×, 93.8%) are real but **synthetic and program-level** — they must be
+The demo numbers (16×, 93.8%) are real but **synthetic and program-level** — they must be
 labeled as such everywhere, and the v0.3 headline must come from item 2 or 8 on captured
 data. If Drain3 beats XDPD on template accuracy, publish that; the differentiators (lossless
 reproduction, no positional assumptions, zero deps, anomaly for free) survive losing that
@@ -385,17 +413,24 @@ winning ones.
 - **No domain semantics in the engine.** `Token = u32`; adapters live in callers.
 - **Not a replacement for exact/prefix/KV caching.** XDPD sits beside them, lossless.
 
-**Retract or rewrite before release** — each is currently wrong or unsupportable:
-1. `RESEARCH.md` §3 "no system satisfies all of these" / "XDPD is the first implementation" →
-   false. DreamCoder, Sequitur, and Drain must be cited, and the claim narrowed to I.1.
-2. `README.md` LLM cost-projection table → built on a contested hit-rate assumption. It is
-   already labeled hypothetical; given the production data (60–70% unique), **delete it**
-   rather than defend it.
-3. Any unqualified "16×" / "93.8%" → always label program-level and synthetic.
-4. `RESEARCH.md` "Known Limitations" omits the two that matter most: no variable slots
-   (III.2) and whole-sequence-only detection (III.1).
-5. `xdpd/ARCHITECTURE.md` is a byte-identical stale copy of this file's predecessor. Collapse
-   it to a pointer or delete it; two drifting architecture docs is worse than one.
+**Retracted before the 0.3.0 release** — all five are done, listed so the record survives:
+1. `RESEARCH.md` "no system satisfies all of these" → retracted; DreamCoder, Sequitur and Drain
+   are cited and the claim narrowed to I.1.
+2. `README.md` LLM cost-projection table → **deleted**, not defended. It rested on a contested
+   hit-rate assumption that production data contradicts.
+3. "16×" / "93.8%" → labelled synthetic and program-level everywhere they appear, and the real
+   measured figures now lead the README instead.
+4. `RESEARCH.md` "Known Limitations" → rewritten for 0.3.0; the two blockers it omitted are
+   fixed, and the list now names what actually remains.
+5. `xdpd/ARCHITECTURE.md` stale duplicate → **deleted**, replaced by a pointer to this file.
+
+Two more found and fixed while preparing the release:
+6. The demo attributed hand-written arithmetic progressions to Yahoo Finance and to production
+   nginx. Both attributions were false; the sequences are now labelled synthetic, which is what
+   they always were.
+7. The Drain3 baseline was quoted from the literature rather than run. `examples/logbench/drain3_baseline.py`
+   now runs it. It reproduces the quoted numbers — the figures were right, they just were not
+   checkable.
 
 ---
 

@@ -1,13 +1,13 @@
 [package]
 name = "xdpd"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 description = "Capability acquisition engine — learns by growing its own instruction set from observed patterns, not by storing data"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/pratikacharya1234/XDPD-Capability-Acquisition-Engine/tree/main/xdpd"
 documentation = "https://docs.rs/xdpd"
 readme = "README.md"
-keywords = ["learning", "ai", "compression", "pattern-detection", "self-modifying"]
+keywords = ["learning", "compression", "log-parsing", "pattern-detection", "anomaly-detection"]
 categories = ["algorithms", "science"]
 authors = ["Pratik Acharya"]
 

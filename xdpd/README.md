@@ -13,6 +13,27 @@ XDPD detects invariants in token streams and compiles them into executable subro
 
 No neural networks. No weights. No gradient descent. No GPU.
 
+## Measured against established baselines
+
+Both benchmarks download public datasets with published ground truth and run the
+incumbent tool for comparison rather than quoting its published numbers.
+
+| Benchmark | XDPD | Baseline |
+|---|---|---|
+| Log template mining, 6 loghub sets, parameters frozen before download | 62.1% mean grouping accuracy | **Drain3 65.5%** |
+| Log template mining, 6 development sets | 86.6% | **Drain3 88.9%** |
+| Numeric anomaly detection, NAB, 4 series | 0.772 mean F1 | **rolling z-score 0.962** |
+
+**XDPD wins 2 of 12 log datasets and loses the mean.** It wins Proxifier
+decisively (52.6% vs Drain3's 2.5%), where Drain's prefix tree collapses. On
+numeric anomaly detection it loses outright to five lines of arithmetic.
+
+Every line a template claims reproduces byte-for-byte — losslessness held on all
+twelve datasets. Learn time is ~1.3ms per 2000 log lines.
+
+Reproduce: `examples/logbench` and `examples/tsbench` in the
+[repository](https://github.com/pratikacharya1234/XDPD-Capability-Acquisition-Engine).
+
 ## Quick Start
 
 ```bash
@@ -39,9 +60,12 @@ learner.observe(&vec![0, 1, 2, 3, 4]);
 // Generate output with or without learned skills
 let (output, program_ops) = learner.generate(&target, true);
 
-// Check if a sequence is anomalous (low compression = unknown pattern)
+// Compression ratio as an anomaly signal: familiar structure compresses,
+// unfamiliar structure does not. Higher is more familiar.
+// Measured on NAB it has good recall and poor precision — it flags the real
+// anomalies and much of the normal region too, scoring 0.772 mean F1 against
+// a rolling z-score's 0.962. Treat it as a cheap screen, not a detector.
 let ratio = learner.check_anomaly(&sequence);
-// ratio >= 2.0 -> normal, ratio < 1.3 -> anomalous
 
 // Access learned skills
 for skill in learner.skills() {
@@ -99,21 +123,20 @@ Observation -> Pattern Detection -> Subroutine Compilation -> DP Composition -> 
 | Structural forgetting | Observation window eviction |
 | Compositional | DP over skills for minimal program |
 | Generalizes across values | Skills store a value-free `PatternShape`, not a frozen instance |
+| Learns templates from records | Skeletons widen as records arrive; a record may turn at most a quarter of a skeleton's fixed positions variable |
 | Survives restarts | Plain-text save/load, zero extra dependencies |
 | Zero dependencies | Pure Rust standard library |
 
-## Example
+## Examples
 
-See the [examples directory](../examples/) for a full real-world demonstration:
-- S&P 500 pattern learning from historical data
-- Server latency baseline detection
-- IoT sensor heartbeat recognition
-- Anomaly detection on market crashes and latency spikes
-- LLM cost reduction analysis (GPT-4o, Claude)
+| Directory | What it is |
+|---|---|
+| [`examples/logbench`](../examples/logbench/) | Template mining vs Drain3 on 12 loghub datasets. Real data, published ground truth, baseline actually run. |
+| [`examples/tsbench`](../examples/tsbench/) | Anomaly detection vs a rolling z-score on NAB. Real labelled data. |
+| [`examples/`](../examples/) | Mechanism walkthrough on **synthetic** hand-written sequences. Illustrates how it works; proves nothing about accuracy. |
 
-Run it:
 ```bash
-cd ../examples && cargo run --release
+cd ../examples/logbench && ./fetch-data.sh && cargo run --release -- data/HDFS_2k.log_structured.csv
 ```
 
 ## License

@@ -1,16 +1,16 @@
-// XDPD Real-World Demonstration
+// XDPD mechanism demonstration — SYNTHETIC DATA
 //
-// Demonstrates the capability acquisition engine operating on
-// verifiable real-world data patterns from three domains:
-//   1. Financial markets — S&P 500 weekly closes (Yahoo Finance)
-//   2. Server monitoring — latency baselines from production nginx
-//   3. IoT telemetry — cyclic sensor heartbeat patterns
+// Every sequence below was written by hand to have an obvious structure, so
+// that the mechanism is easy to follow. None of it is measured, sampled, or
+// sourced from anywhere. The three domains are labels chosen to make the shapes
+// concrete; they are not data from those domains. Real S&P 500 closes do not
+// step by exactly +40 a week, and real nginx latency is not exactly 45ms
+// forever — that is the point: these are illustrations, not evidence.
 //
-// Quantifies LLM integration value: when the same reasoning pattern
-// repeats across user queries, XDPD shortcuts the token generation
-// with 1 subroutine call instead of re-running the full computation.
-//
-// Data sources cited inline. All values verifiable from public records.
+// For measurements against real data with published ground truth, and against
+// the established baselines, see:
+//   examples/logbench  — log template mining vs Drain3 on 12 loghub datasets
+//   examples/tsbench   — anomaly detection vs a rolling z-score on NAB
 
 use std::env;
 use std::fs;
@@ -65,28 +65,25 @@ fn print_usage() {
 
 fn run_analysis(learner: &mut Learner) {
     // -------------------------------------------------------------------
-    // Domain 1: Server latency monitoring
-    // Real pattern: production nginx, idle load, p95 response time.
-    // 6 consecutive readings at 45ms — this exact pattern repeats
-    // every monitoring interval during stable operation.
+    // Domain 1: a constant run, six identical readings.
+    // Framed as an idle-load latency baseline to make the shape concrete.
+    // Hand-written, not sampled from any server.
     // -------------------------------------------------------------------
     let latency_seq = vec![45, 45, 45, 45, 45, 45];
     let latency_repetitions = 20;
-    let latency_label = "Server latency baseline (45ms constant)";
+    let latency_label = "Constant run, framed as a latency baseline (synthetic)";
 
     // -------------------------------------------------------------------
-    // Domain 2: S&P 500 weekly closes — steady rally phase
-    // Source: Yahoo Finance ^GSPC, Jan-Mar 2023.
-    // Arithmetic progression: +40 points per period, 5 readings each.
-    // This exact sequence repeated across rolling windows.
+    // Domain 2: an arithmetic run, +40 per step, five readings.
+    // Framed as an index rally to make the shape concrete. Hand-written —
+    // a real index does not step by exactly +40 for five weeks running.
     // -------------------------------------------------------------------
     let sp500_rally = vec![3970, 4010, 4050, 4090, 4130];
-    let sp500_label = "S&P 500 rally (arithmetic +40pts)";
+    let sp500_label = "Arithmetic run, framed as an index rally (synthetic)";
 
     // -------------------------------------------------------------------
-    // Domain 3: IoT sensor heartbeat
-    // Industrial vibration sensor, 1 pulse per 5 readings.
-    // This exact 20-token pattern repeats every monitoring cycle.
+    // Domain 3: a repeat run, one pulse every five readings.
+    // Framed as a sensor heartbeat to make the shape concrete. Hand-written.
     // -------------------------------------------------------------------
     let iot_pulse = vec![
         1, 0, 0, 0, 0,
@@ -94,7 +91,7 @@ fn run_analysis(learner: &mut Learner) {
         1, 0, 0, 0, 0,
         1, 0, 0, 0, 0,
     ];
-    let iot_label = "IoT sensor heartbeat (1 pulse per 5 readings)";
+    let iot_label = "Repeat run, framed as a sensor heartbeat (synthetic)";
 
     // -------------------------------------------------------------------
     // Phase 1: Observation — feed each pattern repeatedly
@@ -136,8 +133,8 @@ fn run_analysis(learner: &mut Learner) {
     let mut total_tokens = 0u64;
 
     let test_sequences: Vec<(&str, Vec<Token>)> = vec![
-        ("Latency baseline (exact match)", latency_seq.clone()),
-        ("S&P 500 rally (exact match)", sp500_rally.clone()),
+        ("Constant run (exact match)", latency_seq.clone()),
+        ("Arithmetic run (exact match)", sp500_rally.clone()),
         ("IoT heartbeat (exact match)", iot_pulse.clone()),
         (
             "Latency baseline repeated 4x",

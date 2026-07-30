@@ -21,3 +21,9 @@ jobs:
       - name: Build gateway example
         working-directory: examples/gateway
         run: cargo build --release
+      - name: Build logbench benchmark
+        working-directory: examples/logbench
+        run: cargo build --release
+      - name: Build tsbench benchmark
+        working-directory: examples/tsbench
+        run: cargo build --release

@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.3.0
+
+Behaviour change: template learning no longer goes through `min_occurrences`.
+Templates compile on first alignment, because alignment already requires two
+records to exist. The config field still governs `Constant`/`Arithmetic`/
+`Repeat` shapes.
+
+**Template mining went from unusable to competitive on real logs.** Measured on
+12 loghub datasets against Drain3, run rather than quoted: 62.1% vs 65.5% mean
+grouping accuracy on six sets downloaded *after* every parameter was frozen, and
+86.6% vs 88.9% on the six used during development. XDPD wins 2 of 12 — decisively
+on Proxifier (52.6% vs 2.5%) — and loses the mean. HDFS went 32.4% -> 99.7%,
+Apache 1.6% -> 100%. See `examples/logbench`.
+
+- Skeletons now widen as records arrive. Pairwise alignment marked a position
+  fixed wherever two records happened to agree, including positions that vary
+  across the record type; every pair froze a different set of accidents, so no
+  two templates shared a signature, frequency counting never saw a repeat, and
+  the largest event types compiled nothing at all.
+- A record joins a skeleton in exactly one place, under one rule: it may turn at
+  most a quarter of that skeleton's fixed positions variable. Previously records
+  could also merge in via template-to-template comparison, which does not
+  converge — agreement shrinks as templates widen — and let a lone record of a
+  different type dissolve a skeleton with hundreds of members.
+- Templates no longer decay to death mid-ingest. `observe` reinforced nothing,
+  so a skeleton learned early hit the strength floor about 1000 observations
+  later while records of its own type were still arriving. This was the single
+  largest accuracy effect.
+- Alignment candidates are bucketed by record length, so two records of the same
+  shape can meet however far apart they arrive. Bounded by `RECENT_TOTAL`.
+- Compression on HDFS 1.45x -> 11.90x program-level ops. Learn time ~1.3ms per
+  2000 lines. Losslessness held on all twelve datasets.
+- Removed fabricated provenance from the demo: sequences attributed to Yahoo
+  Finance and to production nginx were hand-written arithmetic progressions.
+  They are now labelled synthetic, which is what they always were.
+- `examples/logbench/drain3_baseline.py` runs the Drain3 baseline instead of
+  citing its published figures. It reproduces them.
+- Numeric anomaly detection re-measured at 0.772 mean F1 against a rolling
+  z-score's 0.962. Still loses.
+
 ## 0.2.1
 
 - Dual-licensed under MIT OR Apache-2.0 (was MIT-only). Apache-2.0 adds an

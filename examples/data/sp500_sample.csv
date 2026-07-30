@@ -1,15 +1,17 @@
-# S&P 500 Index — actual weekly closing values
-# Source: Yahoo Finance ^GSPC, Jan 2023 – Jun 2024
-# Each line is a sequence of 5 consecutive weekly closes for pattern learning
+# SYNTHETIC sample input for the CSV reader — not market data.
+# These values were written by hand as clean arithmetic progressions to
+# exercise the parser. An earlier revision of this file attributed them to
+# Yahoo Finance ^GSPC; that attribution was false and has been removed.
+# Real index closes never step by exactly +40. Each line is 5 numbers.
 #
-# Q1 2023 — steady rally
+# rising run
 3970,4010,4050,4090,4130
 4010,4050,4090,4130,4170
 4050,4090,4130,4170,4210
-# Q2 2023 — continued bull market
+# rising run, larger values
 4130,4170,4210,4250,4290
 4170,4210,4250,4290,4330
-# Q3 2023 — pullback + resume
+# falling then rising
 4370,4330,4290,4330,4370
 4330,4370,4410,4450,4490
 # Q4 2023 — year-end rally

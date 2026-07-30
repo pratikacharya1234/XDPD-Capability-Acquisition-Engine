@@ -506,11 +506,11 @@ reported as "blocked, here's why" is a good outcome. A phase reported as "done" 
 is the worst possible outcome, because the next phase gets built on sand.
 
 If a phase's instructions here contradict what the code actually does, **trust the code and
-tell the human.** This document was written against the code at version 0.2.1 and the code may
+tell the human.** This document was written against the code at version 0.2.1 (phases 1-7 have since shipped as 0.3.0) and the code may
 have moved.
 
 ---
 
-*Written against XDPD 0.2.1 (18 tests passing). Full design rationale with sources:
+*Written against XDPD 0.2.1 (18 tests passing); phases 1-7 shipped in 0.3.0 with 55 tests. Full design rationale with sources:
 `docs/ARCHITECTURE.md`. Evidence for every claim, including what's disproven:
 `RESEARCH.md`.*

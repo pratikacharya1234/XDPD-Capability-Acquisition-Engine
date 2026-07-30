@@ -34,7 +34,7 @@ Both systems are measured with the same GA definition on the same `Content`
 field — `grouping_accuracy` in `src/main.rs` and in `drain3_baseline.py` are
 line-for-line equivalent.
 
-## Results — measured 2026-07-30, xdpd 0.2.1 + phases 1-7
+## Results — measured 2026-07-30, xdpd 0.3.0
 
 ### Clean evaluation: downloaded after the parameters were frozen
 

@@ -235,33 +235,28 @@ real-world data, and every published use of them must say so.
 
 ## 7. Known Limitations
 
-Ordered by severity. Items 1 and 2 were missing from the previous version of this document
-and are the two that actually block real-world use.
+Rewritten for 0.3.0. Items 1-3, 5 and 6 of the previous list are now fixed — variable slots,
+runs buried in noise, decay and GC, `Call` error reporting, and a recursion depth bound all
+shipped in phases 1-7. What remains:
 
-1. **No variable slots.** `Constant`/`Arithmetic`/`Repeat` cannot express "same message,
-   different ID". **XDPD cannot match a real log line or a real tool call today.** Fix
-   specified in `docs/ARCHITECTURE.md` §IV.1.
-2. **Whole-sequence-or-nothing detection.** `detect_pattern` returns a pattern only if the
-   entire slice is one invariant, so callers must pre-segment the stream — meaning the
-   measured hit rate is partly a property of the caller's slicing. Note `compose()` already
-   segments its target; only *learning* doesn't. Sequitur solves this (§IV.2).
-3. **No skill decay or GC.** The table grows monotonically, and `learned_signatures` is a
-   second unbounded structure. `strength` and `uses` are **dead fields** — initialized and
-   serialized, but never updated. Sequitur's rule utility is the fix.
-4. **Repeat patterns compress only at program level.** Execution-level cost equals naive
-   emission.
-5. **`Call` silently no-ops on an unknown skill name** — emits nothing, reports success.
-   Unreachable today; a correctness hazard as soon as tables are synced or loaded mismatched.
-6. **No `Call` recursion depth bound.** Flat shapes make depth 1 today; hierarchy makes this a
-   stack-overflow surface.
-7. **`compose()` is O(n·|S|)** — a full skill-table scan per position.
-8. **`check_anomaly` returns `inf`** on an empty sequence (divides by a zero cost).
-9. **Single persistence format version, no migration path.**
-10. **The gateway example does not put XDPD on the hit path** — its cache is an exact
-    `hash_bytes(prompt)` map; the learner only observes. It demonstrates deployment shape,
-    not mechanism.
-
----
+1. **`Template` is fixed-length.** A record type whose messages differ in token count cannot be
+   a single template. Real but smaller than once claimed: zero event types in the Linux, BGL or
+   OpenSSH loghub sets span multiple lengths.
+2. **One global widening budget.** A record may turn at most a quarter of a skeleton's fixed
+   positions variable. Sweeping that constant moved Linux between 17.9% and 63.1% and OpenSSH
+   between 51.8% and 72.5% *in opposite directions* — one number is not right for every log
+   shape, and per-skeleton adaptation is unbuilt.
+3. **The two largest accuracy gaps are undiagnosed.** HPC (-29.7) and Hadoop (-27.5) against
+   Drain3. Diagnose before changing anything.
+4. **Anomaly scoring has good recall and poor precision.** 0.772 mean F1 on NAB against a
+   rolling z-score's 0.962. A cheap screen, not a detector.
+5. **Repeat patterns compress only at program level.** Execution-level cost equals naive
+   emission. Every headline figure in this project is program-level.
+6. **The gateway example does not put XDPD on the hit path.** It demonstrates deployment shape;
+   the structural-cache claim rests on unbuilt work.
+7. **All log measurements are on 2000-line samples** of each loghub dataset, scored by grouping
+   accuracy alone. Full corpora and other metrics (parsing accuracy, edit distance) are
+   unmeasured.
 
 ## 8. Honest Assessment
 
