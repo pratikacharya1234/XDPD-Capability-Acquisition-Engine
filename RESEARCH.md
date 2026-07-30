@@ -140,10 +140,11 @@ assumption it rests on. It stays as a demo of deployment shape; the flagship mov
 machine-generated telemetry, where the repetition is structural by nature and the budget
 already exists. Full reasoning and re-ranked targets: `docs/ARCHITECTURE.md` §I.2, §IV.6.
 
-### 4.4 REMOVE: the LLM cost-projection table in README
+### 4.4 DONE: the LLM cost-projection table is deleted
 
-Already labeled hypothetical, but built on the contested hit-rate assumption. Delete it
-rather than defend it.
+It was labelled hypothetical, but it rested on the contested hit-rate assumption in §3.2, and a
+hypothetical built on a contested premise is not worth defending. Removed from `README.md` in
+0.3.0 rather than rewritten. The README now leads with measured benchmark results instead.
 
 ---
 
