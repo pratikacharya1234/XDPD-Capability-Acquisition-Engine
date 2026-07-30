@@ -14,6 +14,7 @@
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 use std::collections::HashMap;
+use std::collections::VecDeque;
 
 // ---------------------------------------------------------------------------
 // Token type
@@ -21,6 +22,26 @@ use std::collections::HashMap;
 
 /// Unified token type for all discrete observations, actions, and symbols.
 pub type Token = u32;
+
+/// Difference between two tokens, or `None` when it cannot be represented as
+/// the `i32` delta a pattern stores.
+///
+/// Tokens span the entire `u32` range, so their true difference can exceed
+/// `i32`. Computing it as `b as i32 - a as i32` reinterprets both values as
+/// signed and then overflows the subtraction — a debug-build panic on ordinary
+/// data such as hashed identifiers or wide numeric ids. Every delta comparison
+/// in this crate goes through here.
+fn token_delta(from: Token, to: Token) -> Option<i32> {
+    i32::try_from(to as i64 - from as i64).ok()
+}
+
+/// Advance a token by a delta, wrapping rather than panicking.
+///
+/// `i32` addition on a value reinterpreted from `u32` overflows in debug builds
+/// even when the wrapped bit pattern is exactly what the sequence needs.
+fn token_step(v: Token, delta: i32) -> Token {
+    v.wrapping_add(delta as Token)
+}
 
 // ---------------------------------------------------------------------------
 // Instruction set
@@ -106,8 +127,8 @@ impl Pattern {
         match self {
             Pattern::Constant { value, len } => vec![*value; *len],
             Pattern::Arithmetic { start, delta, len } => {
-                let mut s = *start as i32;
-                (0..*len).map(|_| { let v = s as Token; s += delta; v }).collect()
+                let mut v = *start;
+                (0..*len).map(|_| { let out = v; v = token_step(v, *delta); out }).collect()
             }
             Pattern::Repeat { unit, count } => {
                 unit.iter().copied().cycle().take(unit.len() * *count).collect()
@@ -185,6 +206,42 @@ impl Pattern {
 // PatternShape — a pattern's structure, stripped of concrete values
 // ---------------------------------------------------------------------------
 
+/// One position in a `PatternShape::Template`.
+///
+/// Real streams are template-plus-variable: `GET /api/user/8814 200 34ms` is
+/// the same *shape* as `GET /api/user/2291 404 12ms`, differing only where the
+/// id and status sit. `Fixed` pins the parts that never change, `Var` marks the
+/// parts that do, and `Run` covers a counting stretch. `Constant`/`Arithmetic`/
+/// `Repeat` cannot express that mixture, which is why they only ever matched
+/// uniform sequences.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Slot {
+    /// This exact token must appear here, or the match fails.
+    Fixed(Token),
+    /// Any single token. Its value is captured into params.
+    Var,
+    /// An arithmetic run of `len` tokens stepping by `delta`. The start value
+    /// is captured into params; `delta` and `len` are part of the structure.
+    Run { delta: i32, len: usize },
+}
+
+impl Slot {
+    /// How many tokens this slot spans.
+    fn span(&self) -> usize {
+        match self {
+            Slot::Fixed(_) | Slot::Var => 1,
+            Slot::Run { len, .. } => *len,
+        }
+    }
+
+    /// Whether matching this slot captures a param. Keeps `matches` and
+    /// `to_instructions` agreeing on param order — the one way a template can
+    /// silently scramble its own output.
+    fn captures(&self) -> bool {
+        matches!(self, Slot::Var | Slot::Run { .. })
+    }
+}
+
 /// The structural template of a `Pattern`, with concrete values removed.
 /// A `Skill` stores one of these instead of a frozen output sequence, so it
 /// can recognize and reproduce *any* sequence with matching structure —
@@ -194,6 +251,10 @@ pub enum PatternShape {
     Constant { len: usize },
     Arithmetic { delta: i32, len: usize },
     Repeat { unit_len: usize, count: usize },
+    /// The general case: a sequence of fixed, variable, and run slots.
+    /// The three variants above are fast paths for shapes it could also
+    /// express, kept because they encode more compactly and match faster.
+    Template(Vec<Slot>),
 }
 
 impl PatternShape {
@@ -203,6 +264,7 @@ impl PatternShape {
             PatternShape::Constant { len } => *len,
             PatternShape::Arithmetic { len, .. } => *len,
             PatternShape::Repeat { unit_len, count } => unit_len * count,
+            PatternShape::Template(slots) => slots.iter().map(Slot::span).sum(),
         }
     }
 
@@ -212,6 +274,26 @@ impl PatternShape {
             PatternShape::Constant { .. } => 2,
             PatternShape::Arithmetic { .. } => 2,
             PatternShape::Repeat { unit_len, count } => unit_len * 2 * count + 1,
+            // Fixed/Var emit Load+Output, Run emits a single Seq, plus one Ret.
+            PatternShape::Template(slots) => {
+                slots
+                    .iter()
+                    .map(|s| match s {
+                        Slot::Fixed(_) | Slot::Var => 2,
+                        Slot::Run { .. } => 1,
+                    })
+                    .sum::<usize>()
+                    + 1
+            }
+        }
+    }
+
+    /// How many params a match against this shape captures.
+    fn param_count(&self) -> usize {
+        match self {
+            PatternShape::Constant { .. } | PatternShape::Arithmetic { .. } => 1,
+            PatternShape::Repeat { unit_len, .. } => *unit_len,
+            PatternShape::Template(slots) => slots.iter().filter(|s| s.captures()).count(),
         }
     }
 
@@ -229,13 +311,13 @@ impl PatternShape {
                 if slice.len() != *len {
                     return None;
                 }
-                let actual_delta = slice[1] as i32 - slice[0] as i32;
-                if actual_delta != *delta {
+                // `len < 2` would also have indexed slice[1] out of bounds.
+                if *len < 2 {
                     return None;
                 }
                 slice
                     .windows(2)
-                    .all(|w| w[1] as i32 - w[0] as i32 == *delta)
+                    .all(|w| token_delta(w[0], w[1]) == Some(*delta))
                     .then(|| vec![slice[0]])
             }
             PatternShape::Repeat { unit_len, count } => {
@@ -247,6 +329,37 @@ impl PatternShape {
                     .chunks(*unit_len)
                     .all(|chunk| chunk == unit)
                     .then(|| unit.to_vec())
+            }
+            PatternShape::Template(slots) => {
+                // A zero-span shape would be a skill that consumes no input.
+                // `compose` would never make progress with it; refuse it here
+                // rather than let Phase 4 accidentally construct one.
+                if slots.is_empty() || slice.len() != self.span_len() {
+                    return None;
+                }
+                let mut params = Vec::with_capacity(self.param_count());
+                let mut at = 0;
+                for slot in slots {
+                    match slot {
+                        // Exact, or no match. This is the lossless guarantee:
+                        // there is no "close enough" branch here by design.
+                        Slot::Fixed(t) => {
+                            if slice[at] != *t {
+                                return None;
+                            }
+                        }
+                        Slot::Var => params.push(slice[at]),
+                        Slot::Run { delta, len } => {
+                            let run = &slice[at..at + len];
+                            if !run.windows(2).all(|w| token_delta(w[0], w[1]) == Some(*delta)) {
+                                return None;
+                            }
+                            params.push(run[0]);
+                        }
+                    }
+                    at += slot.span();
+                }
+                Some(params)
             }
         }
     }
@@ -271,6 +384,32 @@ impl PatternShape {
                 body.push(Instr::Ret);
                 body
             }
+            PatternShape::Template(slots) => {
+                let mut body = Vec::with_capacity(self.instruction_count());
+                // Params are consumed in slot order — the same order
+                // `matches` produced them. If these two ever disagree, output
+                // comes out scrambled while every length check still passes.
+                let mut next = 0;
+                for slot in slots {
+                    match slot {
+                        Slot::Fixed(t) => {
+                            body.push(Instr::Load(*t));
+                            body.push(Instr::Output);
+                        }
+                        Slot::Var => {
+                            body.push(Instr::Load(params[next]));
+                            body.push(Instr::Output);
+                            next += 1;
+                        }
+                        Slot::Run { delta, len } => {
+                            body.push(Instr::Seq(params[next], *delta, *len));
+                            next += 1;
+                        }
+                    }
+                }
+                body.push(Instr::Ret);
+                body
+            }
         }
     }
 }
@@ -290,6 +429,8 @@ pub struct VM {
     call_stack: Vec<usize>,
     subroutines: HashMap<String, Skill>,
     instr_count: u64,
+    call_depth: u32,
+    last_error: Option<String>,
 }
 
 impl VM {
@@ -303,6 +444,8 @@ impl VM {
             call_stack: Vec::new(),
             subroutines: HashMap::new(),
             instr_count: 0,
+            call_depth: 0,
+            last_error: None,
         }
     }
 
@@ -319,6 +462,8 @@ impl VM {
         self.output.clear();
         self.call_stack.clear();
         self.instr_count = 0;
+        self.call_depth = 0;
+        self.last_error = None;
     }
 
     /// Execute a single instruction. Returns `true` if execution should
@@ -339,21 +484,47 @@ impl VM {
                 self.output.push(self.reg);
             }
             Instr::Seq(start, delta, len) => {
-                let mut val = start as i32;
+                let mut v = start;
                 for _ in 0..len {
-                    self.output.push(val as Token);
-                    val += delta;
+                    self.output.push(v);
+                    v = token_step(v, delta);
                 }
             }
             Instr::Call(name, params) => {
-                if let Some(skill) = self.subroutines.get(&name) {
-                    let body = skill.shape.to_instructions(&params);
-                    self.call_stack.push(self.pc);
-                    let saved = std::mem::replace(&mut self.program, body);
-                    self.pc = 0;
-                    while self.step() {}
-                    self.program = saved;
-                    self.pc = self.call_stack.pop().unwrap();
+                const MAX_CALL_DEPTH: u32 = 64;
+                if self.call_depth >= MAX_CALL_DEPTH {
+                    self.last_error = Some(format!("call depth limit ({}) exceeded", MAX_CALL_DEPTH));
+                    return false;
+                }
+                // Record the use and reinforce before running, then drop the
+                // borrow so the recursive step below can take `self` again.
+                let body = self.subroutines.get_mut(&name).map(|skill| {
+                    skill.uses = skill.uses.saturating_add(1);
+                    skill.strength = skill.strength.saturating_add(STRENGTH_ON_USE).min(STRENGTH_MAX);
+                    skill.shape.to_instructions(&params)
+                });
+                match body {
+                    Some(body) => {
+                        self.call_stack.push(self.pc);
+                        self.call_depth += 1;
+                        let saved = std::mem::replace(&mut self.program, body);
+                        self.pc = 0;
+                        while self.step() {}
+                        self.program = saved;
+                        self.pc = self.call_stack.pop().unwrap();
+                        self.call_depth -= 1;
+                        // An error inside the body must abort the caller too,
+                        // otherwise the outer program keeps emitting output and
+                        // still looks like it succeeded — the exact silent
+                        // failure this branch exists to prevent, one level down.
+                        if self.last_error.is_some() {
+                            return false;
+                        }
+                    }
+                    None => {
+                        self.last_error = Some(format!("skill not found: {}", name));
+                        return false;
+                    }
                 }
             }
             Instr::Ret => {
@@ -393,6 +564,11 @@ impl VM {
         self.subroutines.len()
     }
 
+    /// Get the last error that occurred during execution, if any.
+    pub fn last_error(&self) -> Option<&str> {
+        self.last_error.as_deref()
+    }
+
     /// Return all skills sorted by strength (strongest first).
     pub fn skills(&self) -> Vec<&Skill> {
         let mut skills: Vec<_> = self.subroutines.values().collect();
@@ -403,6 +579,18 @@ impl VM {
     /// Return read-only access to the subroutine table.
     pub fn subroutines(&self) -> &HashMap<String, Skill> {
         &self.subroutines
+    }
+
+    /// Mutable access to the subroutine table, for strength bookkeeping.
+    pub fn subroutines_mut(&mut self) -> &mut HashMap<String, Skill> {
+        &mut self.subroutines
+    }
+
+    /// Forget a skill. Callers holding the learner should prefer
+    /// `Learner::forget_skill`, which also prunes the bookkeeping that would
+    /// otherwise stop the shape from ever being learned again.
+    pub fn remove_skill(&mut self, name: &str) -> Option<Skill> {
+        self.subroutines.remove(name)
     }
 }
 
@@ -421,7 +609,41 @@ impl Default for VM {
 // one skill per line — no external dependencies, consistent with the crate's
 // zero-dependency design.
 
-const SKILLS_FORMAT_VERSION: &str = "XDPD_SKILLS_V1";
+// V2 adds the `tmpl:` shape kind. Writers emit the newest version; readers
+// accept every version ever written, so a table saved by an older build keeps
+// loading forever. Add to ACCEPTED, never remove from it.
+const SKILLS_FORMAT_VERSION: &str = "XDPD_SKILLS_V2";
+const SKILLS_FORMAT_ACCEPTED: &[&str] = &["XDPD_SKILLS_V1", "XDPD_SKILLS_V2"];
+
+impl Slot {
+    // Slot separator is ',' and the Run field separator is '|', so neither
+    // collides with the ':' that splits shape kind from body, or the '\t' that
+    // splits line fields.
+    fn encode(&self) -> String {
+        match self {
+            Slot::Fixed(t) => format!("F{}", t),
+            Slot::Var => "V".to_string(),
+            Slot::Run { delta, len } => format!("R{}|{}", delta, len),
+        }
+    }
+
+    fn decode(s: &str) -> Option<Slot> {
+        if s == "V" {
+            return Some(Slot::Var);
+        }
+        if let Some(rest) = s.strip_prefix('F') {
+            return Some(Slot::Fixed(rest.parse().ok()?));
+        }
+        if let Some(rest) = s.strip_prefix('R') {
+            let (delta, len) = rest.split_once('|')?;
+            return Some(Slot::Run {
+                delta: delta.parse().ok()?,
+                len: len.parse().ok()?,
+            });
+        }
+        None
+    }
+}
 
 impl PatternShape {
     fn encode(&self) -> String {
@@ -429,6 +651,10 @@ impl PatternShape {
             PatternShape::Constant { len } => format!("const:{}", len),
             PatternShape::Arithmetic { delta, len } => format!("arith:{}:{}", delta, len),
             PatternShape::Repeat { unit_len, count } => format!("repeat:{}:{}", unit_len, count),
+            PatternShape::Template(slots) => {
+                let body: Vec<String> = slots.iter().map(Slot::encode).collect();
+                format!("tmpl:{}", body.join(","))
+            }
         }
     }
 
@@ -446,6 +672,16 @@ impl PatternShape {
                 unit_len: parts.next()?.parse().ok()?,
                 count: parts.next()?.parse().ok()?,
             }),
+            "tmpl" => {
+                let body = parts.next()?;
+                if body.is_empty() {
+                    return None;
+                }
+                // Every slot must decode. A partial template would match
+                // fewer tokens than it was saved with and corrupt output.
+                let slots: Option<Vec<Slot>> = body.split(',').map(Slot::decode).collect();
+                Some(PatternShape::Template(slots?))
+            }
             _ => None,
         }
     }
@@ -504,7 +740,7 @@ impl VM {
         let mut lines = std::io::BufReader::new(r).lines();
 
         match lines.next() {
-            Some(Ok(header)) if header == SKILLS_FORMAT_VERSION => {}
+            Some(Ok(header)) if SKILLS_FORMAT_ACCEPTED.contains(&header.as_str()) => {}
             Some(Ok(_)) => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -558,9 +794,10 @@ pub fn detect_pattern(seq: &[Token]) -> Option<Pattern> {
 
     // Arithmetic: constant difference between consecutive tokens
     if n >= 3 {
-        let delta = seq[1] as i32 - seq[0] as i32;
-        if delta != 0 && seq.windows(2).all(|w| w[1] as i32 - w[0] as i32 == delta) {
-            return Some(Pattern::Arithmetic { start: seq[0], delta, len: n });
+        if let Some(delta) = token_delta(seq[0], seq[1]) {
+            if delta != 0 && seq.windows(2).all(|w| token_delta(w[0], w[1]) == Some(delta)) {
+                return Some(Pattern::Arithmetic { start: seq[0], delta, len: n });
+            }
         }
     }
 
@@ -581,8 +818,213 @@ pub fn detect_pattern(seq: &[Token]) -> Option<Pattern> {
 }
 
 // ---------------------------------------------------------------------------
+// Segmentation — finding patterns inside a longer stream
+// ---------------------------------------------------------------------------
+
+/// Find every maximal constant or arithmetic run in `seq` of at least
+/// `min_run` tokens.
+///
+/// `detect_pattern` only answers "is this *whole* slice one invariant", so a
+/// pattern surrounded by unrelated tokens is invisible to it and the caller has
+/// to pre-cut the stream. This scans instead, so `[1,2,3, 91, 50,50,50,50]`
+/// yields the ascending run and the constant run and ignores the noise between.
+///
+/// Runs are maximal and non-overlapping: the longest run at each position wins,
+/// and scanning resumes after it. Without that, one long run would also emit
+/// every shorter run inside itself.
+pub fn scan_runs(seq: &[Token], min_run: usize) -> Vec<Pattern> {
+    let mut out = Vec::new();
+    let n = seq.len();
+    if min_run < 2 || n < min_run {
+        return out;
+    }
+    let mut i = 0;
+    while i + min_run <= n {
+        let delta = match token_delta(seq[i], seq[i + 1]) {
+            Some(d) => d,
+            // Difference too wide to store as a delta; cannot start a run here.
+            None => {
+                i += 1;
+                continue;
+            }
+        };
+        let mut j = i + 1;
+        while j + 1 < n && token_delta(seq[j], seq[j + 1]) == Some(delta) {
+            j += 1;
+        }
+        let len = j - i + 1;
+        if len >= min_run {
+            out.push(if delta == 0 {
+                Pattern::Constant { value: seq[i], len }
+            } else {
+                Pattern::Arithmetic {
+                    start: seq[i],
+                    delta,
+                    len,
+                }
+            });
+            i = j + 1;
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Learn a template by aligning two records position by position: where they
+/// agree the value is structural (`Fixed`), where they differ it is data
+/// (`Var`).
+///
+/// Two examples of a thing are enough to separate its skeleton from its
+/// payload. This is how a real template gets discovered from real records, and
+/// it makes no assumption about *where* the fixed parts sit — unlike parsers
+/// that assume the leading tokens are constant.
+///
+/// **all-`Var` is rejected**: that is a wildcard matching *any* sequence of that
+/// length. It would compress pure noise, which silently destroys the anomaly
+/// signal — everything would look familiar.
+///
+/// An all-`Fixed` result *is* returned. It describes a record type that carries
+/// no payload at all, which sounds degenerate but is extremely common in real
+/// logs — measured on `Apache_2k`, two of six event types are wholly constant
+/// messages. Rejecting those as "memorized literals" silently discarded whole
+/// event types. Callers decide whether a literal earns a place:
+/// `Learner::observe` keeps one only when no structural shape already describes
+/// the sequence, so `[7,7,7,7]` still compiles a constant run rather than a
+/// redundant four-slot literal. Use [`PatternShape::is_literal_template`].
+pub fn align_template(a: &[Token], b: &[Token]) -> Option<PatternShape> {
+    if a.len() != b.len() || a.is_empty() {
+        return None;
+    }
+    let slots: Vec<Slot> = a
+        .iter()
+        .zip(b)
+        .map(|(&x, &y)| if x == y { Slot::Fixed(x) } else { Slot::Var })
+        .collect();
+
+    let fixed = slots.iter().filter(|s| matches!(s, Slot::Fixed(_))).count();
+    if fixed == 0 {
+        return None;
+    }
+    // ponytail: require at least half the slots fixed, so two unrelated records
+    // that happen to share one position don't become a "template". Crude but
+    // it holds the false-positive rate down; revisit against real data, where
+    // genuine mostly-variable records may exist.
+    if fixed * 2 < slots.len() {
+        return None;
+    }
+    Some(PatternShape::Template(slots))
+}
+
+// ---------------------------------------------------------------------------
 // Composition — Dynamic Programming over skills
 // ---------------------------------------------------------------------------
+
+/// A skill lookup key, chosen so it can be computed two ways that must agree:
+/// from a stored shape, and from a candidate slice of the target. That is what
+/// turns candidate selection into a hash probe instead of a table scan.
+///
+/// A key only has to be *necessary* for a match, never sufficient —
+/// `PatternShape::matches` still verifies every candidate the probe returns.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum MatchKey {
+    Const(usize),
+    Arith(usize, i32),
+    Repeat(usize, usize),
+    /// A template whose first slot is `Fixed`: span plus that token. The common
+    /// case for real records, which usually start with something structural.
+    TmplLead(usize, Token),
+    /// A template whose first slot is not `Fixed`, so the leading token says
+    /// nothing about it. These can only be narrowed by span.
+    TmplVarLead(usize),
+}
+
+impl PatternShape {
+    /// Whether this is a template with no variable slots at all: it matches
+    /// exactly one token sequence. Useful for record types that carry no
+    /// payload, redundant when a structural shape already covers the sequence.
+    pub fn is_literal_template(&self) -> bool {
+        matches!(self, PatternShape::Template(slots)
+            if slots.iter().all(|s| matches!(s, Slot::Fixed(_))))
+    }
+
+    fn match_key(&self) -> MatchKey {
+        match self {
+            PatternShape::Constant { len } => MatchKey::Const(*len),
+            PatternShape::Arithmetic { delta, len } => MatchKey::Arith(*len, *delta),
+            PatternShape::Repeat { unit_len, count } => MatchKey::Repeat(*unit_len, *count),
+            PatternShape::Template(slots) => match slots.first() {
+                Some(Slot::Fixed(t)) => MatchKey::TmplLead(self.span_len(), *t),
+                _ => MatchKey::TmplVarLead(self.span_len()),
+            },
+        }
+    }
+}
+
+/// Fill `keys` with every key under which a skill could match this slice.
+///
+/// Writes into a caller-owned buffer rather than returning a fresh `Vec`: this
+/// runs once per (position, span) pair, so allocating here dominated the cost
+/// for small tables — it made a 100-skill compose slower than the unindexed
+/// scan it replaced.
+fn fill_probe_keys(
+    keys: &mut Vec<MatchKey>,
+    slice: &[Token],
+    span: usize,
+    divisors: &[usize],
+    present: &Present,
+) {
+    keys.clear();
+    if present.consts {
+        keys.push(MatchKey::Const(span));
+    }
+    if present.ariths && span >= 2 {
+        if let Some(delta) = token_delta(slice[0], slice[1]) {
+            keys.push(MatchKey::Arith(span, delta));
+        }
+    }
+    // Only divisors that some Repeat skill actually uses as a unit length.
+    // Probing all of them was the single biggest cost in this loop.
+    for &unit in divisors {
+        if present.repeat_units.contains(&unit) {
+            keys.push(MatchKey::Repeat(unit, span / unit));
+        }
+    }
+    if present.tmpl_lead {
+        keys.push(MatchKey::TmplLead(span, slice[0]));
+    }
+    if present.tmpl_varlead {
+        keys.push(MatchKey::TmplVarLead(span));
+    }
+}
+
+/// Which key families the skill table actually contains. Without this the probe
+/// loop asks the index about kinds of skill that were never stored, which for a
+/// small table costs more than the scan the index replaced.
+#[derive(Default)]
+struct Present {
+    consts: bool,
+    ariths: bool,
+    repeat_units: HashSet<usize>,
+    tmpl_lead: bool,
+    tmpl_varlead: bool,
+}
+
+impl Present {
+    fn note(&mut self, shape: &PatternShape) {
+        match shape {
+            PatternShape::Constant { .. } => self.consts = true,
+            PatternShape::Arithmetic { .. } => self.ariths = true,
+            PatternShape::Repeat { unit_len, .. } => {
+                self.repeat_units.insert(*unit_len);
+            }
+            PatternShape::Template(slots) => match slots.first() {
+                Some(Slot::Fixed(_)) => self.tmpl_lead = true,
+                _ => self.tmpl_varlead = true,
+            },
+        }
+    }
+}
 
 /// Compose a minimal-instruction program to produce the target sequence
 /// using the available skills. Uses dynamic programming: for each position
@@ -597,8 +1039,51 @@ pub fn compose(
         return (vec![Instr::Ret], 0);
     }
 
+    // Index every skill under a key that can be recomputed from a candidate
+    // slice, so finding candidates is a hash probe rather than a scan of the
+    // whole table. Indexing by span alone is not enough: thousands of skills
+    // can share a span, and if none of them match, every one still gets tested.
+    //
+    // Entries are sorted by name so composition is deterministic instead of
+    // dependent on HashMap iteration order.
+    let mut entries: Vec<(&String, &Skill)> = skills.iter().collect();
+    entries.sort_by(|a, b| a.0.cmp(b.0));
+
+    // Below this, scanning every skill beats building and probing an index.
+    // Measured on a 512-token target: at 100 skills the scan is roughly twice
+    // as fast, by 1000 the index is five times faster.
+    const INDEX_THRESHOLD: usize = 256;
+    let use_index = entries.len() >= INDEX_THRESHOLD;
+
+    let mut index: HashMap<MatchKey, Vec<usize>> = HashMap::new();
+    let mut spans: Vec<usize> = Vec::new();
+    let mut present = Present::default();
+    if use_index {
+        for (idx, (_, skill)) in entries.iter().enumerate() {
+            let span = skill.shape.span_len();
+            if span == 0 || span > n {
+                continue;
+            }
+            index.entry(skill.shape.match_key()).or_default().push(idx);
+            present.note(&skill.shape);
+            spans.push(span);
+        }
+    }
+    spans.sort_unstable();
+    spans.dedup();
+
+    // Pair each span with its proper divisors, for probing Repeat shapes.
+    // A Vec rather than a HashMap so the hot loop indexes instead of hashing.
+    let spans: Vec<(usize, Vec<usize>)> = spans
+        .into_iter()
+        .map(|len| (len, (1..=len / 2).filter(|u| len % u == 0).collect()))
+        .collect();
+    let mut keys: Vec<MatchKey> = Vec::with_capacity(32);
+
+    // `None` in the choice slot means the naive per-token step was taken.
+    type Choice = Option<(usize, Option<(usize, Vec<Token>)>)>;
     let mut dp = vec![u64::MAX; n + 1];
-    let mut choice: Vec<Option<(usize, String, Vec<Token>)>> = vec![None; n + 1];
+    let mut choice: Vec<Choice> = vec![None; n + 1];
     dp[0] = 0;
 
     for i in 0..n {
@@ -609,43 +1094,76 @@ pub fn compose(
         // Naive: emit one token (2 ops: Load + Output)
         if dp[i] + 2 < dp[i + 1] {
             dp[i + 1] = dp[i] + 2;
-            choice[i + 1] = Some((i, String::new(), Vec::new()));
+            choice[i + 1] = Some((i, None));
         }
 
-        // Try each learned skill whose *structure* matches at position i —
-        // not just the exact values it was originally compiled from.
-        for (name, skill) in skills {
-            let slen = skill.shape.span_len();
-            if i + slen <= n {
-                if let Some(params) = skill.shape.matches(&target[i..i + slen]) {
-                    // Cost: 1 Call instruction (atomic — body size doesn't count)
-                    let cost = 1u64;
-                    if dp[i] + cost < dp[i + slen] {
-                        dp[i + slen] = dp[i] + cost;
-                        choice[i + slen] = Some((i, name.clone(), params));
+        // Try skills by span. Every Call costs exactly 1, so once one skill of
+        // a given span matches there is nothing to gain from testing the rest.
+        if !use_index {
+            // Few enough skills that testing them all is cheaper than building
+            // and querying an index. The `dp` guard means the first skill to
+            // cover a given span wins, matching the indexed path's behaviour.
+            for (idx, (_, skill)) in entries.iter().enumerate() {
+                let span = skill.shape.span_len();
+                if span == 0 || i + span > n || dp[i] + 1 >= dp[i + span] {
+                    continue;
+                }
+                if let Some(params) = skill.shape.matches(&target[i..i + span]) {
+                    dp[i + span] = dp[i] + 1;
+                    choice[i + span] = Some((i, Some((idx, params))));
+                }
+            }
+            continue;
+        }
+
+        for (span, divisors) in &spans {
+            let span = *span;
+            if i + span > n {
+                break; // spans are sorted, so nothing longer fits either
+            }
+            if dp[i] + 1 >= dp[i + span] {
+                continue; // cannot improve; skip the match attempt entirely
+            }
+            let slice = &target[i..i + span];
+            let mut hit = None;
+            fill_probe_keys(&mut keys, slice, span, divisors, &present);
+            'probe: for key in keys.iter() {
+                if let Some(candidates) = index.get(key) {
+                    for &idx in candidates {
+                        if let Some(params) = entries[idx].1.shape.matches(slice) {
+                            hit = Some((idx, params));
+                            break 'probe;
+                        }
                     }
                 }
+            }
+            if let Some((idx, params)) = hit {
+                dp[i + span] = dp[i] + 1;
+                choice[i + span] = Some((i, Some((idx, params))));
             }
         }
     }
 
-    // Backtrack to construct the program
+    // Backtrack. Steps are collected end-to-start and reversed at the end, so
+    // the two instructions of a naive step are pushed in reverse order too —
+    // pushing Load then Output here would emit `Output, Load` after the
+    // reverse, which emits the register's previous value instead of the token.
     let mut prog = Vec::new();
     let mut pos = n;
     while pos > 0 {
         match &choice[pos] {
-            Some((prev, name, _)) if name.is_empty() => {
-                prog.push(Instr::Load(target[*prev]));
+            Some((prev, None)) => {
                 prog.push(Instr::Output);
+                prog.push(Instr::Load(target[*prev]));
                 pos = *prev;
             }
-            Some((prev, name, params)) => {
-                prog.push(Instr::Call(name.clone(), params.clone()));
+            Some((prev, Some((idx, params)))) => {
+                prog.push(Instr::Call(entries[*idx].0.clone(), params.clone()));
                 pos = *prev;
             }
             None => {
-                prog.push(Instr::Load(target[pos - 1]));
                 prog.push(Instr::Output);
+                prog.push(Instr::Load(target[pos - 1]));
                 pos -= 1;
             }
         }
@@ -684,10 +1202,67 @@ impl Default for LearnerConfig {
 /// subroutines, and uses DP composition to generate minimal programs.
 /// Raw observations are consumed and discarded; only the subroutine table
 /// persists as memory.
+/// Upper bound on tokens buffered by `observe_token`/`observe_chunk` before an
+/// automatic flush. A caller that never calls `flush()` would otherwise grow
+/// this buffer without limit.
+///
+/// Deliberately a private const rather than a `LearnerConfig` field: that
+/// struct has public fields and is built with struct-literal syntax by
+/// downstream code (see `examples/gateway`), so adding a field to it would be
+/// a breaking change.
+const MAX_PENDING_TOKENS: usize = 4096;
+
+// Forgetting. A skill table that only grows becomes slow and full of junk in a
+// long-running process, so strength is now load-bearing: calling a skill
+// reinforces it, time erodes it, and what nothing calls eventually goes.
+//
+// These are consts for the same reason as `MAX_PENDING_TOKENS`: `LearnerConfig`
+// has public fields and downstream code builds it with struct-literal syntax,
+// so growing it would be a breaking change.
+
+/// Observations between decay ticks.
+const DECAY_INTERVAL: u64 = 100;
+/// Strength lost per decay tick.
+const DECAY_AMOUNT: i32 = 1;
+/// Strength gained each time a skill is actually called.
+const STRENGTH_ON_USE: i32 = 2;
+/// Ceiling, so a hot skill cannot become permanently immortal.
+const STRENGTH_MAX: i32 = 100;
+/// At or below this, a skill is forgotten.
+const STRENGTH_FLOOR: i32 = 0;
+/// Hard cap on table size. The weakest skills go first.
+const MAX_SKILLS: usize = 4096;
+
+/// How many recent raw records are kept for alignment. Each new record is
+/// aligned against these, so this bounds both memory and per-observation work.
+const RECENT_RECORDS: usize = 16;
+
 pub struct Learner {
     vm: VM,
-    observation_window: Vec<Vec<Token>>,
+    /// Signatures contributed by the last `window_size` observations, oldest
+    /// first. `None` means that observation had no detectable pattern.
+    ///
+    /// Note what this does *not* hold: raw tokens. The window used to keep a
+    /// copy of every observed sequence purely to recount frequencies. Only the
+    /// signature is needed for that, so the raw tokens are now dropped as soon
+    /// as they are examined — which is what the design claimed all along.
+    window: VecDeque<Vec<String>>,
+    /// Live occurrence count per signature across the window, alongside the
+    /// shape needed to compile it. Maintained incrementally (+1 on push,
+    /// -1 on evict) instead of recounting the whole window on every call.
+    freq: HashMap<String, (PatternShape, u32)>,
     learned_signatures: HashSet<String>,
+    /// Tokens accumulated by the streaming API, awaiting `flush()`.
+    pending: Vec<Token>,
+    /// The last few raw records, kept only to align new records against.
+    ///
+    /// Alignment is inherently a comparison between two records, so a small
+    /// bounded buffer of raw tokens is unavoidable here. It is working state
+    /// with a hard cap, not storage: nothing accumulates, and the skill table
+    /// is still the only thing that persists.
+    recent: VecDeque<Vec<Token>>,
+    /// Observations seen, used only to pace decay ticks.
+    ticks: u64,
     config: LearnerConfig,
 }
 
@@ -701,9 +1276,67 @@ impl Learner {
     pub fn with_config(config: LearnerConfig) -> Self {
         Learner {
             vm: VM::new(),
-            observation_window: Vec::new(),
+            window: VecDeque::new(),
+            freq: HashMap::new(),
             learned_signatures: HashSet::new(),
+            pending: Vec::new(),
+            recent: VecDeque::new(),
+            ticks: 0,
             config,
+        }
+    }
+
+    /// Forget a skill completely.
+    ///
+    /// The subroutine table is not the only bookkeeping involved.
+    /// `learned_signatures` records "I have already compiled this shape" and
+    /// exists to stop duplicate skills — so dropping a skill while leaving its
+    /// signature behind makes that shape **permanently unlearnable**: the
+    /// learner would keep believing it already knows it and never recompile it.
+    /// `freq` has to go too, otherwise a still-high window count would
+    /// resurrect the skill on the very next matching observation and eviction
+    /// would achieve nothing. All three are pruned together, always.
+    pub fn forget_skill(&mut self, name: &str) -> bool {
+        match self.vm.remove_skill(name) {
+            Some(skill) => {
+                self.learned_signatures.remove(&skill.signature);
+                self.freq.remove(&skill.signature);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Erode every skill's strength and forget whatever falls to the floor.
+    /// Called automatically every `DECAY_INTERVAL` observations.
+    fn decay(&mut self) {
+        let mut doomed = Vec::new();
+        for (name, skill) in self.vm.subroutines_mut() {
+            skill.strength -= DECAY_AMOUNT;
+            if skill.strength <= STRENGTH_FLOOR {
+                doomed.push(name.clone());
+            }
+        }
+        for name in doomed {
+            self.forget_skill(&name);
+        }
+    }
+
+    /// Enforce the hard table cap, weakest first.
+    fn enforce_cap(&mut self) {
+        if self.vm.skill_count() <= MAX_SKILLS {
+            return;
+        }
+        let mut ranked: Vec<(i32, String)> = self
+            .vm
+            .subroutines()
+            .values()
+            .map(|s| (s.strength, s.name.clone()))
+            .collect();
+        ranked.sort();
+        let excess = self.vm.skill_count() - MAX_SKILLS;
+        for (_, name) in ranked.into_iter().take(excess) {
+            self.forget_skill(&name);
         }
     }
 
@@ -718,39 +1351,127 @@ impl Learner {
             return Vec::new();
         }
 
-        // Maintain the sliding window
-        if self.observation_window.len() >= self.config.window_size {
-            self.observation_window.remove(0);
-        }
-        self.observation_window.push(sequence.to_vec());
-
-        // Count pattern frequencies across the window
-        let mut freq: HashMap<String, (Pattern, u32)> = HashMap::new();
-        for window_seq in &self.observation_window {
-            if let Some(pattern) = detect_pattern(window_seq) {
-                let sig = pattern.signature();
-                let entry = freq.entry(sig).or_insert_with(|| (pattern, 0));
-                entry.1 += 1;
+        // Evict the oldest observation, dropping its contribution to the counts.
+        if self.window.len() >= self.config.window_size {
+            if let Some(old_sigs) = self.window.pop_front() {
+                for sig in old_sigs {
+                    if let Some(entry) = self.freq.get_mut(&sig) {
+                        entry.1 -= 1;
+                        if entry.1 == 0 {
+                            self.freq.remove(&sig);
+                        }
+                    }
+                }
             }
         }
 
-        // Compile patterns that meet the occurrence threshold
-        let mut new_skills = Vec::new();
-        for (sig, (pattern, count)) in freq {
-            if count >= self.config.min_occurrences
-                && !self.learned_signatures.contains(&sig)
-            {
-                let name = format!("skill_{}", sig);
-                let mut skill = Skill::new(name.clone(), pattern.shape());
-                skill.signature = sig.clone();
+        // Everything this one observation contributes, keyed by signature so a
+        // shape found by two different routes still counts once. Without the
+        // dedupe, a sequence that is entirely one run would be counted twice —
+        // by `detect_pattern` and again by `scan_runs` — and reach the
+        // threshold in half the observations it should.
+        let mut found: HashMap<String, PatternShape> = HashMap::new();
 
+        // 1. Whole-sequence invariant. Also the only route that finds Repeat.
+        if let Some(pattern) = detect_pattern(sequence) {
+            found.insert(pattern.signature(), pattern.shape());
+        }
+
+        // 2. Runs buried anywhere inside the sequence.
+        for pattern in scan_runs(sequence, 3) {
+            found.insert(pattern.signature(), pattern.shape());
+        }
+
+        // 3. Templates, by aligning against recent records of the same length.
+        for prev in &self.recent {
+            if let Some(shape) = align_template(prev, sequence) {
+                // A literal earns its place only when nothing structural
+                // already describes this sequence. Otherwise [7,7,7,7] would
+                // compile a constant run *and* a redundant 4-slot literal.
+                if shape.is_literal_template() && !found.is_empty() {
+                    continue;
+                }
+                found.insert(shape.encode(), shape);
+            }
+        }
+
+        if self.recent.len() >= RECENT_RECORDS {
+            self.recent.pop_front();
+        }
+        self.recent.push_back(sequence.to_vec());
+
+        // Count them, and compile any that just crossed the threshold. Only
+        // signatures touched here can have crossed it — eviction only lowers
+        // counts — so there is no reason to re-scan the whole table.
+        let mut new_skills = Vec::new();
+        let mut sigs = Vec::with_capacity(found.len());
+        for (sig, shape) in found {
+            let entry = self.freq.entry(sig.clone()).or_insert((shape, 0));
+            entry.1 += 1;
+            let crossed = entry.1 >= self.config.min_occurrences;
+            if crossed && !self.learned_signatures.contains(&sig) {
+                let name = format!("skill_{}", sig);
+                let mut skill = Skill::new(name.clone(), entry.0.clone());
+                skill.signature = sig.clone();
                 self.vm.add_skill(skill);
-                self.learned_signatures.insert(sig);
+                self.learned_signatures.insert(sig.clone());
                 new_skills.push(name);
             }
+            sigs.push(sig);
         }
+        self.window.push_back(sigs);
+
+        self.ticks += 1;
+        if self.ticks % DECAY_INTERVAL == 0 {
+            self.decay();
+        }
+        self.enforce_cap();
 
         new_skills
+    }
+
+    /// Feed a single token into the stream.
+    ///
+    /// Tokens accumulate in a pending buffer until `flush()` marks the end of a
+    /// record. That boundary has to be explicit: a stream carries no signal for
+    /// where one observation stops and the next begins, and detecting patterns
+    /// on every prefix would compile a separate skill for every length the
+    /// record passed through on its way to being complete.
+    ///
+    /// Normally returns an empty list. If the pending buffer reaches
+    /// `MAX_PENDING_TOKENS` it flushes automatically and returns whatever that
+    /// produced, so a caller that never flushes cannot leak memory.
+    pub fn observe_token(&mut self, t: Token) -> Vec<String> {
+        self.pending.push(t);
+        if self.pending.len() >= MAX_PENDING_TOKENS {
+            return self.flush();
+        }
+        Vec::new()
+    }
+
+    /// Feed several tokens at once. Same buffering rules as `observe_token`.
+    pub fn observe_chunk(&mut self, ts: &[Token]) -> Vec<String> {
+        self.pending.extend_from_slice(ts);
+        if self.pending.len() >= MAX_PENDING_TOKENS {
+            return self.flush();
+        }
+        Vec::new()
+    }
+
+    /// Mark the end of a record: treat everything buffered as one complete
+    /// observation. Feeding a sequence token by token and then flushing is
+    /// equivalent to passing that whole sequence to `observe()`.
+    pub fn flush(&mut self) -> Vec<String> {
+        if self.pending.is_empty() {
+            return Vec::new();
+        }
+        let seq = std::mem::take(&mut self.pending);
+        self.observe(&seq)
+    }
+
+    /// Number of tokens buffered and not yet flushed.
+    pub fn pending_len(&self) -> usize {
+        self.pending.len()
     }
 
     /// Returns (output_tokens, program_level_instruction_count).
@@ -781,6 +1502,9 @@ impl Learner {
     pub fn check_anomaly(&mut self, sequence: &[Token]) -> f64 {
         let (_, naive) = self.generate(sequence, false);
         let (_, learned) = self.generate(sequence, true);
+        if learned == 0 {
+            return 1.0;
+        }
         naive as f64 / learned as f64
     }
 
@@ -1084,4 +1808,847 @@ mod tests {
         let (out, _) = learner.generate(&target, true);
         assert_eq!(out, target);
     }
+
+    #[test]
+    fn vm_missing_skill_reports_error() {
+        let mut vm = VM::new();
+        let prog = vec![Instr::Call("nonexistent".into(), vec![]), Instr::Ret];
+        vm.load_program(prog);
+        vm.run();
+        assert!(vm.last_error().is_some());
+        assert!(vm.last_error().unwrap().contains("skill not found"));
+        assert_eq!(vm.output(), &[]);
+    }
+
+    #[test]
+    fn vm_call_depth_is_balanced_and_bounded() {
+        // Two halves. First: a normal call must leave call_depth back at 0 —
+        // this is what proves the increment/decrement pair is correct, and it
+        // is the half a preloaded counter can never check.
+        let mut vm = VM::new();
+        vm.add_skill(Skill::new(
+            "s".into(),
+            PatternShape::Arithmetic { delta: 2, len: 3 },
+        ));
+        vm.load_program(vec![Instr::Call("s".into(), vec![10]), Instr::Ret]);
+        vm.run();
+        assert_eq!(vm.output(), &[10, 12, 14]);
+        assert_eq!(vm.call_depth, 0, "depth must unwind after a successful call");
+        assert!(vm.last_error().is_none());
+
+        // Second: at the ceiling, the guard refuses the call instead of
+        // recursing. `call_depth` is set directly because `mod tests` is a
+        // child module — no test-only public API needed on VM.
+        //
+        // ponytail: a genuine cycle cannot be built yet. No PatternShape emits
+        // Instr::Call, so no skill body can call anything, so recursion depth
+        // is structurally capped at 1 today. This guard is here for the
+        // hierarchical skills in AGENTS.md Phase 4 — write the real cycle test
+        // the moment a shape can emit a Call.
+        vm.reset();
+        vm.load_program(vec![Instr::Call("s".into(), vec![10]), Instr::Ret]);
+        vm.call_depth = 64;
+        vm.run();
+        assert!(vm.last_error().unwrap().contains("call depth limit"));
+        assert_eq!(vm.output(), &[], "a refused call must emit nothing");
+    }
+
+    #[test]
+    fn failed_call_halts_execution_and_emits_nothing() {
+        // A failed call must stop the program, not just record an error while
+        // the following instructions keep appending output.
+        //
+        // Scope note: this covers the TOP-LEVEL call only. The sibling guard
+        // for a failure inside a nested body (see Instr::Call in `step`) is
+        // deliberately NOT covered — verified by deleting that guard and
+        // watching this test still pass. It cannot be covered until a
+        // PatternShape can emit an Instr::Call. Do not claim it is tested.
+        let mut vm = VM::new();
+        vm.load_program(vec![
+            Instr::Call("missing".into(), vec![]),
+            Instr::Load(5),
+            Instr::Output,
+            Instr::Ret,
+        ]);
+        vm.run();
+        assert!(vm.last_error().unwrap().contains("skill not found"));
+        assert_eq!(
+            vm.output(),
+            &[],
+            "execution must halt at the failed call, not continue to Load(5)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 2 — slotted templates
+    // -----------------------------------------------------------------------
+
+    /// Runs `shape` with `params` and returns what it emitted.
+    fn run_shape(shape: &PatternShape, params: Vec<Token>) -> Vec<Token> {
+        let mut vm = VM::new();
+        vm.add_skill(Skill::new("t".into(), shape.clone()));
+        vm.load_program(vec![Instr::Call("t".into(), params), Instr::Ret]);
+        vm.run();
+        assert!(vm.last_error().is_none(), "{:?}", vm.last_error());
+        vm.output().to_vec()
+    }
+
+    #[test]
+    fn template_match_is_lossless_across_varying_values() {
+        // Three "log lines" as tokens: a fixed verb, a varying id, a fixed
+        // status, a varying duration. One shape covers all three.
+        let shape = PatternShape::Template(vec![
+            Slot::Fixed(71),
+            Slot::Var,
+            Slot::Fixed(200),
+            Slot::Var,
+        ]);
+        assert_eq!(shape.span_len(), 4);
+
+        for input in [
+            vec![71, 8814, 200, 34],
+            vec![71, 2291, 200, 41],
+            vec![71, 9007, 200, 12],
+            vec![71, 0, 200, 4294967295], // extremes still exact
+        ] {
+            let params = shape.matches(&input).expect("should match");
+            assert_eq!(params, vec![input[1], input[3]], "captured in slot order");
+            assert_eq!(
+                run_shape(&shape, params),
+                input,
+                "THE LOSSLESS GUARANTEE: output must equal input byte-for-byte"
+            );
+        }
+    }
+
+    #[test]
+    fn template_refuses_any_mismatch_with_no_near_misses() {
+        let shape =
+            PatternShape::Template(vec![Slot::Fixed(71), Slot::Var, Slot::Fixed(200)]);
+        assert!(shape.matches(&[71, 8814, 200]).is_some());
+        // Every one of these differs from the template. None may match.
+        assert!(shape.matches(&[72, 8814, 200]).is_none(), "leading Fixed");
+        assert!(shape.matches(&[71, 8814, 404]).is_none(), "trailing Fixed");
+        assert!(shape.matches(&[71, 8814]).is_none(), "too short");
+        assert!(shape.matches(&[71, 8814, 200, 5]).is_none(), "too long");
+        assert!(shape.matches(&[]).is_none(), "empty");
+        // A shape with no slots consumes no input and must never match.
+        assert!(PatternShape::Template(vec![]).matches(&[]).is_none());
+    }
+
+    #[test]
+    fn template_run_slot_verifies_step_and_captures_start() {
+        // Fixed, then a counting run, then a Var. Param order is
+        // [run start, var] — if `matches` and `to_instructions` disagreed on
+        // ordering, the run would start at 77 and the tail would print 100.
+        let shape = PatternShape::Template(vec![
+            Slot::Fixed(9),
+            Slot::Run { delta: 2, len: 4 },
+            Slot::Var,
+        ]);
+        assert_eq!(shape.span_len(), 6);
+
+        let input = vec![9, 100, 102, 104, 106, 77];
+        let params = shape.matches(&input).expect("should match");
+        assert_eq!(params, vec![100, 77], "run start first, then the var");
+        assert_eq!(run_shape(&shape, params), input);
+
+        // Wrong step size inside the run must be refused.
+        assert!(shape.matches(&[9, 100, 103, 104, 106, 77]).is_none());
+        // Negative deltas work too.
+        let down = PatternShape::Template(vec![Slot::Run { delta: -1, len: 3 }, Slot::Var]);
+        let input = vec![50, 49, 48, 7];
+        assert_eq!(run_shape(&down, down.matches(&input).unwrap()), input);
+    }
+
+    #[test]
+    fn compose_covers_repeated_log_lines_with_one_call_each() {
+        // Two 4-token lines that share a shape. Naive cost would be 16 ops
+        // (2 per token); with the template it should be 2 Calls.
+        let mut vm = VM::new();
+        vm.add_skill(Skill::new(
+            "logline".into(),
+            PatternShape::Template(vec![
+                Slot::Fixed(71),
+                Slot::Var,
+                Slot::Fixed(200),
+                Slot::Var,
+            ]),
+        ));
+        let target = vec![71, 8814, 200, 34, 71, 2291, 200, 41];
+        let (prog, cost) = compose(vm.subroutines(), &target);
+        assert_eq!(cost, 2, "one Call per line, got program {:?}", prog);
+
+        vm.load_program(prog);
+        vm.run();
+        assert!(vm.last_error().is_none());
+        assert_eq!(vm.output(), target.as_slice(), "must reproduce exactly");
+    }
+
+    #[test]
+    fn template_survives_save_and_restart() {
+        let shape = PatternShape::Template(vec![
+            Slot::Fixed(71),
+            Slot::Var,
+            Slot::Run { delta: -1, len: 3 },
+        ]);
+        let mut vm = VM::new();
+        vm.add_skill(Skill::new("logline".into(), shape.clone()));
+
+        let mut buf = Vec::new();
+        vm.save_skills(&mut buf).unwrap();
+        assert!(
+            String::from_utf8_lossy(&buf).starts_with("XDPD_SKILLS_V2"),
+            "writer must emit the newest format version"
+        );
+
+        // Stand-in for a fresh process.
+        let mut restarted = VM::new();
+        assert_eq!(restarted.load_skills(buf.as_slice()).unwrap(), 1);
+        assert_eq!(
+            restarted.subroutines()["logline"].shape, shape,
+            "shape must survive the round trip exactly"
+        );
+
+        let input = vec![71, 8814, 50, 49, 48];
+        let params = shape.matches(&input).unwrap();
+        let (prog, _) = compose(restarted.subroutines(), &input);
+        restarted.load_program(prog);
+        restarted.run();
+        assert_eq!(restarted.output(), input.as_slice());
+        assert_eq!(params, vec![8814, 50]);
+    }
+
+    #[test]
+    fn v1_skills_files_still_load_after_v2_bump() {
+        // Hand-written V1 file, exactly as an older build would have emitted.
+        // This must keep working forever — see SKILLS_FORMAT_ACCEPTED.
+        let v1 = "XDPD_SKILLS_V1\nskill_arith:d2x5\tarith:2:5\t10\t0\tarith:d2x5\n";
+        let mut vm = VM::new();
+        assert_eq!(vm.load_skills(v1.as_bytes()).unwrap(), 1);
+
+        // And the old skill still generalizes to unseen values.
+        let unseen = vec![100, 102, 104, 106, 108];
+        let (prog, cost) = compose(vm.subroutines(), &unseen);
+        assert_eq!(cost, 1);
+        vm.load_program(prog);
+        vm.run();
+        assert_eq!(vm.output(), unseen.as_slice());
+    }
+
+    #[test]
+    fn every_slot_kind_round_trips_through_its_encoding() {
+        // Regression: the first version of Slot::decode split on the second
+        // character, so the single-character "V" returned None and every
+        // template containing a Var silently failed to load. Each kind gets
+        // checked on its own here so a future encoding change can't repeat it.
+        for slot in [
+            Slot::Var,
+            Slot::Fixed(0),
+            Slot::Fixed(71),
+            Slot::Fixed(4294967295),
+            Slot::Run { delta: 2, len: 4 },
+            Slot::Run { delta: -1, len: 3 },
+            Slot::Run { delta: 0, len: 1 },
+        ] {
+            let encoded = slot.encode();
+            assert_eq!(
+                Slot::decode(&encoded).as_ref(),
+                Some(&slot),
+                "round trip failed for {:?} (encoded as {:?})",
+                slot,
+                encoded
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_template_encoding_is_rejected() {
+        // A half-decodable template would span fewer tokens than it was saved
+        // with and silently corrupt output, so any bad slot fails the line.
+        for bad in [
+            "XDPD_SKILLS_V2\nx\ttmpl:F1,ZZZ,F2\t10\t0\tsig\n",
+            "XDPD_SKILLS_V2\nx\ttmpl:\t10\t0\tsig\n",
+            "XDPD_SKILLS_V2\nx\ttmpl:R5\t10\t0\tsig\n", // Run missing |len
+        ] {
+            let mut vm = VM::new();
+            assert_eq!(
+                vm.load_skills(bad.as_bytes()).unwrap(),
+                0,
+                "should have skipped the bad line: {}",
+                bad
+            );
+            assert_eq!(vm.skill_count(), 0);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 3 — streaming ingestion
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn streaming_one_token_at_a_time_matches_batch_observe() {
+        // Same input, same result, different delivery.
+        let records = [
+            vec![0, 2, 4, 6, 8],
+            vec![100, 102, 104, 106, 108],
+            vec![7, 7, 7, 7],
+            vec![50, 52, 54, 56, 58],
+            vec![9, 9, 9, 9],
+            vec![1, 1, 1, 1],
+        ];
+
+        let mut batch = Learner::new();
+        for r in &records {
+            batch.observe(r);
+        }
+
+        let mut streamed = Learner::new();
+        for r in &records {
+            for &t in r {
+                streamed.observe_token(t);
+            }
+            streamed.flush(); // record boundary
+        }
+
+        assert_eq!(streamed.skill_count(), batch.skill_count());
+        let mut a: Vec<_> = streamed.skills().iter().map(|s| s.name.clone()).collect();
+        let mut b: Vec<_> = batch.skills().iter().map(|s| s.name.clone()).collect();
+        a.sort();
+        b.sort();
+        assert_eq!(a, b, "streaming must learn exactly the same skills");
+    }
+
+    #[test]
+    fn observe_chunk_matches_token_by_token() {
+        let seq = vec![3, 6, 9, 12];
+        let mut by_token = Learner::new();
+        let mut by_chunk = Learner::new();
+        for _ in 0..4 {
+            for &t in &seq {
+                by_token.observe_token(t);
+            }
+            by_token.flush();
+            by_chunk.observe_chunk(&seq);
+            by_chunk.flush();
+        }
+        assert_eq!(by_chunk.skill_count(), by_token.skill_count());
+        assert!(by_chunk.skill_count() > 0);
+    }
+
+    #[test]
+    fn flush_is_required_to_end_a_record() {
+        // Without a flush nothing is learned, because the record is not over.
+        let mut learner = Learner::new();
+        for _ in 0..10 {
+            for &t in &[0, 2, 4, 6, 8] {
+                learner.observe_token(t);
+            }
+        }
+        assert_eq!(learner.skill_count(), 0, "no boundary means no observation");
+        assert_eq!(learner.pending_len(), 50);
+        learner.flush();
+        assert_eq!(learner.pending_len(), 0);
+    }
+
+    #[test]
+    fn pending_buffer_auto_flushes_and_cannot_grow_without_bound() {
+        // A caller that never flushes must not leak. Feed well past the cap.
+        let mut learner = Learner::new();
+        for i in 0..(MAX_PENDING_TOKENS * 3) {
+            learner.observe_token(i as Token);
+        }
+        assert!(
+            learner.pending_len() < MAX_PENDING_TOKENS,
+            "pending grew to {} without flushing",
+            learner.pending_len()
+        );
+    }
+
+    #[test]
+    fn streams_100k_tokens_without_quadratic_blowup() {
+        // The old window re-ran detect_pattern over every entry on every call
+        // and memmoved the whole window on eviction, so cost grew with
+        // window_size. A large window here would have been the worst case.
+        let mut learner = Learner::with_config(LearnerConfig {
+            min_occurrences: 3,
+            window_size: 1000,
+        });
+        let start = std::time::Instant::now();
+        let mut n = 0u32;
+        for i in 0..20_000u32 {
+            // 5 tokens per record, 100k tokens total.
+            for k in 0..5 {
+                learner.observe_token(i.wrapping_mul(7).wrapping_add(k * 2));
+                n += 1;
+            }
+            learner.flush();
+        }
+        let elapsed = start.elapsed();
+        assert_eq!(n, 100_000);
+        // Generous bound so this can never flake on a loaded machine or in a
+        // debug build; the real figure is printed with --nocapture.
+        assert!(
+            elapsed.as_secs() < 20,
+            "100k tokens took {:?}, expected far less",
+            elapsed
+        );
+        println!("100k tokens in {:?} ({} skills)", elapsed, learner.skill_count());
+    }
+
+    #[test]
+    fn window_evicts_and_decrements_counts_incrementally() {
+        // A shape seen twice, then pushed out of a size-3 window by unrelated
+        // observations, must not later reach the threshold from stale counts.
+        let mut learner = Learner::with_config(LearnerConfig {
+            min_occurrences: 3,
+            window_size: 3,
+        });
+        learner.observe(&[0, 2, 4]); // arith:d2x3, count 1
+        learner.observe(&[0, 2, 4]); // count 2
+        assert_eq!(learner.skill_count(), 0);
+
+        // Three unrelated observations evict both of the above.
+        learner.observe(&[5, 5, 5]);
+        learner.observe(&[6, 6, 6]);
+        learner.observe(&[7, 7, 7]);
+
+        // The window no longer holds any arith:d2x3, so one more must not tip
+        // it over the threshold — it should be counted as the first, not third.
+        learner.observe(&[0, 2, 4]);
+        assert!(
+            !learner.skills().iter().any(|s| s.signature == "arith:d2x3"),
+            "evicted observations must not still count toward the threshold"
+        );
+        // Sanity: the constants did repeat 3 times, so they did get learned.
+        assert!(learner.skills().iter().any(|s| s.signature == "const:x3"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 4 — finding patterns inside a stream
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn scan_runs_finds_patterns_buried_in_noise() {
+        // detect_pattern sees nothing here: the slice as a whole is not one
+        // invariant. scan_runs finds both runs and ignores the noise.
+        let seq = vec![1, 2, 3, 4, 91, 50, 50, 50, 50, 7, 33];
+        assert!(detect_pattern(&seq).is_none(), "whole-slice detection fails");
+
+        let runs = scan_runs(&seq, 3);
+        assert_eq!(runs.len(), 2, "got {:?}", runs);
+        assert_eq!(
+            runs[0],
+            Pattern::Arithmetic { start: 1, delta: 1, len: 4 }
+        );
+        assert_eq!(runs[1], Pattern::Constant { value: 50, len: 4 });
+    }
+
+    #[test]
+    fn scan_runs_reports_maximal_non_overlapping_runs() {
+        // One long run must yield exactly one Pattern, not every shorter run
+        // nested inside it.
+        let runs = scan_runs(&[0, 2, 4, 6, 8, 10], 3);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0], Pattern::Arithmetic { start: 0, delta: 2, len: 6 });
+
+        // Too short to qualify.
+        assert!(scan_runs(&[5, 6], 3).is_empty());
+        assert!(scan_runs(&[1, 9, 4, 77], 3).is_empty());
+    }
+
+    #[test]
+    fn learner_finds_a_pattern_buried_in_noise() {
+        let mut learner = Learner::new();
+        // Same constant run each time, surrounded by changing noise.
+        for i in 0..5u32 {
+            learner.observe(&[i * 977 + 1, 42, 42, 42, 42, i * 331 + 7]);
+        }
+        assert!(
+            learner.skills().iter().any(|s| s.signature == "const:x4"),
+            "learned: {:?}",
+            learner.skills().iter().map(|s| &s.signature).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn alignment_separates_skeleton_from_payload() {
+        let a = [71, 8814, 200, 34];
+        let b = [71, 2291, 200, 41];
+        let shape = align_template(&a, &b).expect("should align");
+        assert_eq!(
+            shape,
+            PatternShape::Template(vec![
+                Slot::Fixed(71),
+                Slot::Var,
+                Slot::Fixed(200),
+                Slot::Var,
+            ])
+        );
+        // And it reproduces both records exactly.
+        for rec in [a, b] {
+            let params = shape.matches(&rec).unwrap();
+            assert_eq!(run_shape(&shape, params), rec.to_vec());
+        }
+    }
+
+    #[test]
+    fn alignment_rejects_wildcards_but_keeps_literals() {
+        // Identical records -> all Fixed. Originally rejected as a "memorized
+        // literal"; the loghub benchmark showed that threw away whole event
+        // types (two of six on Apache_2k are wholly constant messages), so it
+        // is now returned and the caller decides whether it earns a place.
+        let literal = align_template(&[1, 2, 3], &[1, 2, 3]).expect("kept");
+        assert!(literal.is_literal_template());
+        assert!(!PatternShape::Constant { len: 3 }.is_literal_template());
+        // Nothing in common -> all Var -> a wildcard that matches any 3 tokens.
+        // Accepting this would compress noise and destroy the anomaly signal.
+        assert!(align_template(&[1, 2, 3], &[9, 8, 7]).is_none());
+        // Mostly variable -> too weak to trust as structure.
+        assert!(align_template(&[1, 2, 3, 4], &[1, 9, 8, 7]).is_none());
+        // Different lengths cannot be aligned positionally.
+        assert!(align_template(&[1, 2, 3], &[1, 2]).is_none());
+        assert!(align_template(&[], &[]).is_none());
+    }
+
+    #[test]
+    fn learner_learns_a_template_from_realistic_records() {
+        // Three "log lines" as tokens: fixed verb, varying id, fixed status,
+        // varying duration. One template must cover all three.
+        let records = [
+            vec![71, 8814, 200, 34],
+            vec![71, 2291, 200, 41],
+            vec![71, 9007, 200, 12],
+        ];
+        let mut learner = Learner::with_config(LearnerConfig {
+            min_occurrences: 2,
+            window_size: 100,
+        });
+        for r in &records {
+            learner.observe(r);
+        }
+
+        let template = learner
+            .skills()
+            .into_iter()
+            .find(|s| matches!(s.shape, PatternShape::Template(_)))
+            .expect("a template should have been learned");
+
+        // Every record — including ones it was not aligned from — reproduces
+        // exactly through the learned template.
+        for r in &records {
+            let params = template.shape.matches(r).expect("template should match");
+            assert_eq!(run_shape(&template.shape, params), *r);
+        }
+
+        // And an unseen record with the same skeleton also matches.
+        let unseen = vec![71, 55555, 200, 99];
+        let params = template.shape.matches(&unseen).unwrap();
+        assert_eq!(run_shape(&template.shape, params), unseen);
+
+        // A record with a different skeleton must not match.
+        assert!(template.shape.matches(&[72, 8814, 404, 34]).is_none());
+    }
+
+    #[test]
+    fn wide_token_values_do_not_overflow() {
+        // Regression: delta was computed as `b as i32 - a as i32`, which
+        // reinterprets large u32 tokens as negative and then overflows the
+        // subtraction — a debug-build panic on ordinary data like hashed ids.
+        // Every one of these would have crashed.
+        let wide = vec![4_000_000_000, 100, 4_294_967_295, 7, 2_147_483_648];
+        assert!(detect_pattern(&wide).is_none());
+        scan_runs(&wide, 3);
+        align_template(&wide, &[4_000_000_000, 1, 4_294_967_295, 2, 9]);
+
+        let mut learner = Learner::new();
+        for _ in 0..5 {
+            learner.observe(&wide);
+        }
+        learner.check_anomaly(&wide);
+
+        // A run near the top of the range must still round-trip exactly.
+        let shape = PatternShape::Arithmetic { delta: 1, len: 3 };
+        let near_max = vec![4_294_967_293, 4_294_967_294, 4_294_967_295];
+        let params = shape.matches(&near_max).expect("should match");
+        assert_eq!(run_shape(&shape, params), near_max);
+
+        // And a delta too wide for i32 is simply not a run, rather than a panic.
+        assert_eq!(token_delta(0, 4_000_000_000), None);
+        assert_eq!(token_delta(0, 5), Some(5));
+        assert_eq!(token_delta(5, 0), Some(-5));
+    }
+
+    #[test]
+    fn pure_noise_learns_nothing() {
+        // False patterns are worse than no patterns. Deterministic LCG so this
+        // test can never flake.
+        let mut learner = Learner::new();
+        let mut x: u32 = 12345;
+        for _ in 0..200 {
+            let rec: Vec<Token> = (0..6)
+                .map(|_| {
+                    x = x.wrapping_mul(1664525).wrapping_add(1013904223);
+                    x
+                })
+                .collect();
+            learner.observe(&rec);
+        }
+        assert_eq!(
+            learner.skill_count(),
+            0,
+            "learned from noise: {:?}",
+            learner.skills().iter().map(|s| &s.signature).collect::<Vec<_>>()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 5 — forgetting
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn calling_a_skill_records_the_use_and_reinforces_it() {
+        let mut learner = Learner::new();
+        let seq = vec![0, 2, 4, 6, 8];
+        for _ in 0..3 {
+            learner.observe(&seq);
+        }
+        let before = learner.skills()[0].clone();
+        assert_eq!(before.uses, 0, "unused to begin with");
+
+        learner.generate(&seq, true);
+        let after = learner.skills()[0].clone();
+        assert_eq!(after.uses, 1, "a call must be recorded");
+        assert!(
+            after.strength > before.strength,
+            "use must reinforce: {} -> {}",
+            before.strength,
+            after.strength
+        );
+
+        // Strength is capped so a hot skill cannot become immortal.
+        for _ in 0..200 {
+            learner.generate(&seq, true);
+        }
+        assert!(learner.skills()[0].strength <= STRENGTH_MAX);
+    }
+
+    #[test]
+    fn unused_skills_decay_and_are_forgotten() {
+        let mut learner = Learner::new();
+        for _ in 0..3 {
+            learner.observe(&[0, 2, 4, 6, 8]);
+        }
+        assert_eq!(learner.skill_count(), 1);
+
+        // Observe unrelated noise long enough for decay ticks to erode it.
+        // Nothing calls the skill, so nothing reinforces it.
+        let mut x: u32 = 999;
+        let ticks_needed = (10 / DECAY_AMOUNT) as u64 + 1;
+        for _ in 0..(DECAY_INTERVAL * ticks_needed + 10) {
+            let rec: Vec<Token> = (0..6)
+                .map(|_| {
+                    x = x.wrapping_mul(1664525).wrapping_add(1013904223);
+                    x
+                })
+                .collect();
+            learner.observe(&rec);
+        }
+        assert_eq!(
+            learner.skill_count(),
+            0,
+            "an unused skill should eventually be forgotten"
+        );
+    }
+
+    #[test]
+    fn forgotten_shapes_can_be_learned_again() {
+        // THE TRAP. `learned_signatures` means "already compiled this shape".
+        // Evicting a skill without pruning it there makes the shape
+        // permanently unlearnable — the learner keeps thinking it knows it.
+        let mut learner = Learner::new();
+        let seq = vec![0, 2, 4, 6, 8];
+        for _ in 0..3 {
+            learner.observe(&seq);
+        }
+        assert_eq!(learner.skill_count(), 1);
+        let name = learner.skills()[0].name.clone();
+
+        assert!(learner.forget_skill(&name));
+        assert_eq!(learner.skill_count(), 0);
+
+        // Feed the same shape again. It must come back.
+        for _ in 0..3 {
+            learner.observe(&seq);
+        }
+        assert_eq!(
+            learner.skill_count(),
+            1,
+            "a forgotten shape must be relearnable"
+        );
+        // And still work.
+        let (out, cost) = learner.generate(&seq, true);
+        assert_eq!(out, seq);
+        assert_eq!(cost, 1);
+    }
+
+    #[test]
+    fn forget_skill_reports_whether_anything_was_removed() {
+        let mut learner = Learner::new();
+        assert!(!learner.forget_skill("nonexistent"));
+    }
+
+    #[test]
+    fn table_stays_bounded_under_a_long_varied_run() {
+        // Many distinct shapes over a long run must not grow without bound.
+        let mut learner = Learner::with_config(LearnerConfig {
+            min_occurrences: 2,
+            window_size: 200,
+        });
+        for len in 2..60usize {
+            for delta in 1..40i32 {
+                let rec: Vec<Token> =
+                    (0..len).map(|k| (k as i32 * delta) as Token).collect();
+                learner.observe(&rec);
+                learner.observe(&rec);
+            }
+        }
+        assert!(
+            learner.skill_count() <= MAX_SKILLS,
+            "table grew to {}",
+            learner.skill_count()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 6 — composition correctness and scaling
+    // -----------------------------------------------------------------------
+
+    /// Composes `target` against `skills`, runs it, and asserts the output is
+    /// byte-identical to the target. Every compose result must satisfy this
+    /// regardless of how much of the target the skills covered.
+    fn assert_composes_exactly(skills: &HashMap<String, Skill>, target: &[Token]) -> u64 {
+        let (prog, cost) = compose(skills, target);
+        let mut vm = VM::new();
+        for (name, skill) in skills {
+            let mut s = skill.clone();
+            s.name = name.clone();
+            vm.add_skill(s);
+        }
+        vm.load_program(prog.clone());
+        vm.run();
+        assert!(vm.last_error().is_none(), "{:?}", vm.last_error());
+        assert_eq!(
+            vm.output(),
+            target,
+            "compose must reproduce the target exactly; program was {:?}",
+            prog
+        );
+        cost
+    }
+
+    #[test]
+    fn compose_reproduces_uncovered_targets_exactly() {
+        // Regression: the naive per-token step pushed Load then Output and then
+        // the whole program was reversed, so it executed as Output,Load and
+        // emitted the register's stale value. `compose(&{}, &[7,8,9])` produced
+        // [0,7,8]. Every prior compose test used a fully covered target, so
+        // nothing caught it.
+        let empty: HashMap<String, Skill> = HashMap::new();
+        assert_eq!(assert_composes_exactly(&empty, &[7, 8, 9]), 6);
+        assert_eq!(assert_composes_exactly(&empty, &[42]), 2);
+        assert_composes_exactly(&empty, &[1, 3, 7, 15, 31]);
+    }
+
+    #[test]
+    fn compose_reproduces_partially_covered_targets_exactly() {
+        // Mixed coverage: some spans hit a skill, the rest fall back to naive.
+        // This is the common real case and the one the bug corrupted.
+        let mut skills = HashMap::new();
+        skills.insert(
+            "run5".to_string(),
+            Skill::new("run5".into(), PatternShape::Arithmetic { delta: 2, len: 5 }),
+        );
+
+        // noise, then a matching run, then more noise.
+        let target = vec![91, 77, 0, 2, 4, 6, 8, 55];
+        let cost = assert_composes_exactly(&skills, &target);
+        // 3 naive tokens (2 ops each) + 1 Call = 7
+        assert_eq!(cost, 7, "expected the run to be covered by one Call");
+
+        // Run at the very start and very end too.
+        assert_composes_exactly(&skills, &[0, 2, 4, 6, 8, 99]);
+        assert_composes_exactly(&skills, &[99, 0, 2, 4, 6, 8]);
+    }
+
+    #[test]
+    fn compose_is_deterministic_across_runs() {
+        // Skills are sorted by name before indexing, so the same inputs must
+        // always produce the same program — HashMap order must not leak in.
+        let mut skills = HashMap::new();
+        for (name, shape) in [
+            ("a", PatternShape::Constant { len: 3 }),
+            ("b", PatternShape::Constant { len: 3 }),
+            ("c", PatternShape::Arithmetic { delta: 1, len: 3 }),
+        ] {
+            skills.insert(name.to_string(), Skill::new(name.into(), shape));
+        }
+        let target = vec![5, 5, 5, 1, 2, 3, 8];
+        let (first, cost) = compose(&skills, &target);
+        for _ in 0..20 {
+            let (again, c) = compose(&skills, &target);
+            assert_eq!(again, first, "composition must be deterministic");
+            assert_eq!(c, cost);
+        }
+        assert_composes_exactly(&skills, &target);
+    }
+
+    #[test]
+    fn composition_stays_fast_as_the_table_grows() {
+        // Before the span index, every position tested every skill. Timing is
+        // printed rather than asserted tightly so this cannot flake; the shape
+        // of the curve is the point.
+        let target: Vec<Token> = (0..512).map(|i| (i * 3) as Token).collect();
+        let mut timings = Vec::new();
+        for count in [100usize, 1000, 10_000] {
+            let mut skills = HashMap::new();
+            for k in 0..count {
+                // Distinct shapes, almost none of which can match.
+                let name = format!("s{:06}", k);
+                skills.insert(
+                    name.clone(),
+                    Skill::new(
+                        name,
+                        PatternShape::Arithmetic {
+                            delta: (k % 977 + 7) as i32,
+                            len: 3 + (k % 29),
+                        },
+                    ),
+                );
+            }
+            let start = std::time::Instant::now();
+            let (_, _) = compose(&skills, &target);
+            let elapsed = start.elapsed();
+            timings.push((count, elapsed));
+            println!("{:>6} skills -> {:?}", count, elapsed);
+        }
+        // 100x more skills must not cost anywhere near 100x more time.
+        let (_, small) = timings[0];
+        let (_, large) = timings[2];
+        assert!(
+            large.as_nanos() < small.as_nanos().saturating_mul(25).max(1_000_000),
+            "scaling looks linear in table size: {:?} -> {:?}",
+            small,
+            large
+        );
+    }
+
+    #[test]
+    fn check_anomaly_empty_sequence_returns_finite() {
+        let mut learner = Learner::new();
+        let ratio = learner.check_anomaly(&[]);
+        assert!(ratio.is_finite());
+        assert_eq!(ratio, 1.0);
+    }
 }
+
