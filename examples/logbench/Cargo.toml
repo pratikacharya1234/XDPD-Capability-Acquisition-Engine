@@ -1,0 +1,10 @@
+[package]
+name = "xdpd-logbench"
+version = "0.1.0"
+edition = "2021"
+description = "Measures XDPD template mining against loghub ground truth. Real data, real numbers."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+xdpd = { path = "../../xdpd" }

@@ -22,7 +22,26 @@ Observation Stream -> Pattern Detection -> Subroutine Compilation -> DP Composit
 
 Starts with 5 primitives: `Load`, `Output`, `Seq`, `Call`, `Ret`. All other capabilities are learned.
 
-## Proven Results (Live Demo)
+## Measured on real data — XDPD loses to the incumbents
+
+Read this before the demo numbers below it.
+
+| Benchmark | Dataset | XDPD | Baseline |
+|---|---|---|---|
+| [Log template mining](examples/logbench/) | loghub HDFS_2k | 32.4% GA | **Drain3 99.8%** |
+| [Log template mining](examples/logbench/) | loghub Apache_2k | 1.6% GA | **Drain3 100.0%** |
+| [Numeric anomaly detection](examples/tsbench/) | NAB, 4 series | 0.748 mean F1 | **rolling z-score 0.962** |
+
+Both benchmarks are runnable and fetch their own data. No measured axis
+currently favours XDPD over a specialized incumbent — see
+[docs/ARCHITECTURE.md §I.5](docs/ARCHITECTURE.md) for what that does and does
+not leave standing.
+
+## Demo Results — synthetic data, not a benchmark
+
+The numbers below are exact arithmetic on **sequences this project made up**,
+counted at the program level. They show the mechanism works. They are not
+measurements against real-world data and must not be read as any.
 
 101 tokens across 3 domains. 38 observations. 3 skills learned.
 
@@ -36,7 +55,7 @@ Starts with 5 primitives: `Load`, `Output`, `Seq`, `Call`, `Ret`. All other capa
 
 Reproduce it: `cd examples && cargo run --release`.
 
-## Generalization (Measured)
+## Generalization (synthetic)
 
 Skills store a value-free structural template, not a frozen copy of one
 instance — `[0,2,4,6,8]` and `[100,102,104,106,108]` both compile to the
@@ -119,6 +138,8 @@ cd examples/gateway && cargo run --release
 | [RESEARCH.md](RESEARCH.md) | Gap analysis, research findings, hypothesis, honest limitations |
 | [CHANGELOG.md](CHANGELOG.md) | Version history — what actually changed and why |
 | [examples/README.md](examples/README.md) | Demo walkthrough with full output |
+| [examples/logbench/](examples/logbench/) | Log template mining vs Drain3 on loghub — measured, XDPD loses |
+| [examples/tsbench/](examples/tsbench/) | Anomaly detection vs rolling z-score on NAB — measured, XDPD loses |
 | [examples/gateway/](examples/gateway/) | LLM inference proxy demo — runnable, not production-hardened |
 | [docs.rs/xdpd](https://docs.rs/xdpd) | API documentation |
 | [crates.io/crates/xdpd](https://crates.io/crates/xdpd) | Library package |
@@ -134,8 +155,11 @@ XDPD/
 │   └── ARCHITECTURE.md
 ├── examples/
 │   ├── gateway/        # LLM inference proxy demo
+│   ├── logbench/       # real-data benchmark vs Drain3 (loghub)
+│   ├── tsbench/        # real-data benchmark vs z-score (NAB)
 │   ├── src/main.rs     # CLI benchmark + generalization test
 │   └── data/           # Sample CSV
+├── AGENTS.md
 ├── .github/workflows/ci.yml
 ├── CHANGELOG.md
 ├── RESEARCH.md
